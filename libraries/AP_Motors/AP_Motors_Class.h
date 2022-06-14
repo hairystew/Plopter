@@ -1,9 +1,10 @@
 #pragma once
 
 #include <AP_Common/AP_Common.h>
-#include <AP_Math/AP_Math.h>
+#include <AP_Math/AP_Math.h>        // ArduPilot Mega Vector/Matrix math Library
+#include <AP_Notify/AP_Notify.h>      // Notify library
+#include <SRV_Channel/SRV_Channel.h>
 #include <Filter/Filter.h>         // filter library
-#include <GCS_MAVLink/GCS_MAVLink.h>
 
 // offsets for motors in motor_out and _motor_filtered arrays
 #define AP_MOTORS_MOT_1 0U
@@ -73,6 +74,7 @@ public:
         MOTOR_FRAME_SCRIPTING_MATRIX = 15,
         MOTOR_FRAME_6DOF_SCRIPTING = 16,
         MOTOR_FRAME_DYNAMIC_SCRIPTING_MATRIX = 17,
+        MOTOR_FRAME_PLOPTER = 18,
     };
 
     // return string corresponding to frame_class
@@ -96,6 +98,7 @@ public:
         MOTOR_FRAME_TYPE_NYT_X = 17, // X frame, no differential torque for yaw
         MOTOR_FRAME_TYPE_BF_X_REV = 18, // X frame, betaflight ordering, reversed motors
         MOTOR_FRAME_TYPE_Y4 = 19, //Y4 Quadrotor frame
+        MOTOR_FRAME_TYPE_PLOPTER = 20, //Plopter modification by good ole hairystew (Harrison Stewart)
     };
 
 
@@ -221,7 +224,7 @@ public:
 
     // get_motor_mask - returns a bitmask of which outputs are being used for motors (1 means being used)
     //  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
-    virtual uint32_t    get_motor_mask() = 0;
+    virtual uint16_t    get_motor_mask() = 0;
 
     // pilot input in the -1 ~ +1 range for roll, pitch and yaw. 0~1 range for throttle
     void                set_radio_passthrough(float roll_input, float pitch_input, float throttle_input, float yaw_input);
@@ -309,10 +312,10 @@ protected:
     float               _air_density_ratio;     // air density / sea level density - decreases in altitude
 
     // mask of what channels need fast output
-    uint32_t            _motor_fast_mask;
+    uint16_t            _motor_fast_mask;
 
     // mask of what channels need to use SERVOn_MIN/MAX for output mapping
-    uint32_t            _motor_pwm_range_mask;
+    uint16_t            _motor_pwm_range_mask;
     
     // pass through variables
     float _roll_radio_passthrough;     // roll input from pilot in -1 ~ +1 range.  used for setup and providing servo feedback while landed

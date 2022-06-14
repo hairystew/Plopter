@@ -578,7 +578,7 @@ def generate_tasklist(ctx, do_print=True):
                 if 'sitl' in board or 'SITL' in board:
                     task['targets'] = ['antennatracker', 'copter', 'heli', 'plane', 'rover', 'sub', 'replay']
                 elif 'linux' in board:
-                    task['targets'] = ['antennatracker', 'copter', 'heli', 'plane', 'rover', 'sub']
+                    task['targets'] = ['antennatracker', 'copter', 'heli', 'plane', 'rover', 'sub', 'plopter']
                 else:
                     task['targets'] = ['antennatracker', 'copter', 'heli', 'plane', 'rover', 'sub', 'bootloader']
                     task['buildOptions'] = '--upload'
@@ -683,6 +683,7 @@ def _build_recursion(bld):
     common_dirs_excl = [
         'modules',
         'libraries/AP_HAL_*',
+        'libraries/SITL',
     ]
 
     hal_dirs_patterns = [
@@ -793,7 +794,7 @@ ardupilotwaf.build_command('check-all',
     doc='shortcut for `waf check --alltests`',
 )
 
-for name in ('antennatracker', 'copter', 'heli', 'plane', 'rover', 'sub', 'blimp', 'bootloader','iofirmware','AP_Periph','replay'):
+for name in ('antennatracker', 'copter', 'heli', 'plane', 'rover', 'sub', 'blimp', 'plopter', 'bootloader','iofirmware','AP_Periph','replay'):
     ardupilotwaf.build_command(name,
         program_group_list=name,
         doc='builds %s programs' % name,
