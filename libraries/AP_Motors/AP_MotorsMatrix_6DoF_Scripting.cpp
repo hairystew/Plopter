@@ -295,6 +295,9 @@ bool AP_MotorsMatrix_6DoF_Scripting::init(uint8_t expected_num_motors) {
     }
 
     switch (num_motors) {
+        case 2:
+            _mav_type = MAV_TYPE_PLOPTER;
+            break;
         case 3:
             _mav_type = MAV_TYPE_TRICOPTER;
             break;

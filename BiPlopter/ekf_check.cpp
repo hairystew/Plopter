@@ -8,11 +8,11 @@
  */
 
 #ifndef EKF_CHECK_ITERATIONS_MAX
- # define EKF_CHECK_ITERATIONS_MAX          10      // 1 second (ie. 10 iterations at 10hz) of bad variances signals a failure
+# define EKF_CHECK_ITERATIONS_MAX          10      // 1 second (ie. 10 iterations at 10hz) of bad variances signals a failure
 #endif
 
 #ifndef EKF_CHECK_WARNING_TIME
- # define EKF_CHECK_WARNING_TIME            (30*1000)   // warning text messages are sent to ground no more than every 30 seconds
+# define EKF_CHECK_WARNING_TIME            (30*1000)   // warning text messages are sent to ground no more than every 30 seconds
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -61,7 +61,7 @@ void Plopter::ekf_check()
 
     // increment or decrement counters and take action
     if (!checks_passed) {
-        // if compass is not yet flagged as bad
+        // if variances are not yet flagged as bad
         if (!ekf_check_state.bad_variance) {
             // increase counter
             ekf_check_state.fail_count++;
@@ -94,7 +94,7 @@ void Plopter::ekf_check()
         if (ekf_check_state.fail_count > 0) {
             ekf_check_state.fail_count--;
 
-            // if compass is flagged as bad and the counter reaches zero then clear flag
+            // if variances are flagged as bad and the counter reaches zero then clear flag
             if (ekf_check_state.bad_variance && ekf_check_state.fail_count == 0) {
                 ekf_check_state.bad_variance = false;
                 AP::logger().Write_Error(LogErrorSubsystem::EKFCHECK, LogErrorCode::EKFCHECK_VARIANCE_CLEARED);
@@ -152,11 +152,6 @@ bool Plopter::ekf_over_threshold()
 // failsafe_ekf_event - perform ekf failsafe
 void Plopter::failsafe_ekf_event()
 {
-    // return immediately if ekf failsafe already triggered
-    if (failsafe.ekf) {
-        return;
-    }
-
     // EKF failsafe event has occurred
     failsafe.ekf = true;
     AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_EKFINAV, LogErrorCode::FAILSAFE_OCCURRED);
@@ -211,6 +206,19 @@ void Plopter::failsafe_ekf_off_event(void)
         gcs().send_text(MAV_SEVERITY_CRITICAL, "EKF Failsafe Cleared");
     }
     AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_EKFINAV, LogErrorCode::FAILSAFE_RESOLVED);
+}
+
+// re-check if the flight mode requires GPS but EKF failsafe is active
+// this should be called by flight modes that are changing their submode from one that does NOT require a position estimate to one that does
+void Plopter::failsafe_ekf_recheck()
+{
+    // return immediately if not in ekf failsafe
+    if (!failsafe.ekf) {
+        return;
+    }
+
+    // trigger EKF failsafe action
+    failsafe_ekf_event();
 }
 
 // check for ekf yaw reset and adjust target heading, also log position reset

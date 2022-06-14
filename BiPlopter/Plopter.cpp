@@ -14,12 +14,66 @@
  */
 
 /*
- *  Plopter (also known as APM, APM::Plopter or just Plopter)
+ *  ArduPlopter (also known as APM, APM:Plopter or just Plopter)
+ *  Wiki:           plopter.ardupilot.org
+ *  Creator:        Jason Short
+ *  Lead Developer: Randy Mackay
+ *  Lead Tester:    Marco Robustini
+ *  Based on code and ideas from the Arduplopter team: Leonard Hall, Andrew Tridgell, Robert Lefebvre, Pat Hickey, Michael Oborne, Jani Hirvinen,
+                                                      Olivier Adler, Kevin Hester, Arthur Benemann, Jonathan Challinger, John Arne Birkeland,
+                                                      Jean-Louis Naudin, Mike Smith, and more
+ *  Thanks to: Chris Anderson, Jordi Munoz, Jason Short, Doug Weibel, Jose Julio
  *
- *  I (Harrison Stewart) am modifying the ArduPlopter portion of the code.
- *  The goal is to implement a custom controller for use in a biplopter
- *  airplane.
-*/
+ *  Special Thanks to contributors (in alphabetical order by first name):
+ *
+ *  Adam M Rivera       :Auto Compass Declination
+ *  Amilcar Lucas       :Camera mount library
+ *  Andrew Tridgell     :General development, Mavlink Support
+ *  Andy Piper          :Harmonic notch, In-flight FFT, Bi-directional DShot, various drivers
+ *  Angel Fernandez     :Alpha testing
+ *  AndreasAntonopoulous:GeoFence
+ *  Arthur Benemann     :DroidPlanner GCS
+ *  Benjamin Pelletier  :Libraries
+ *  Bill King           :Single Plopter
+ *  Christof Schmid     :Alpha testing
+ *  Craig Elder         :Release Management, Support
+ *  Dani Saez           :V Octo Support
+ *  Doug Weibel         :DCM, Libraries, Control law advice
+ *  Emile Castelnuovo   :VRBrain port, bug fixes
+ *  Gregory Fletcher    :Camera mount orientation math
+ *  Guntars             :Arming safety suggestion
+ *  HappyKillmore       :Mavlink GCS
+ *  Hein Hollander      :Octo Support, Heli Testing
+ *  Igor van Airde      :Control Law optimization
+ *  Jack Dunkle         :Alpha testing
+ *  James Goppert       :Mavlink Support
+ *  Jani Hiriven        :Testing feedback
+ *  Jean-Louis Naudin   :Auto Landing
+ *  John Arne Birkeland :PPM Encoder
+ *  Jose Julio          :Stabilization Control laws, MPU6k driver
+ *  Julien Dubois       :PosHold flight mode
+ *  Julian Oes          :Pixhawk
+ *  Jonathan Challinger :Inertial Navigation, CompassMot, Spin-When-Armed
+ *  Kevin Hester        :Andropilot GCS
+ *  Max Levine          :Tri Support, Graphics
+ *  Leonard Hall        :Flight Dynamics, Throttle, Loiter and Navigation Controllers
+ *  Marco Robustini     :Lead tester
+ *  Michael Oborne      :Mission Planner GCS
+ *  Mike Smith          :Pixhawk driver, coding support
+ *  Olivier Adler       :PPM Encoder, piezo buzzer
+ *  Pat Hickey          :Hardware Abstraction Layer (HAL)
+ *  Robert Lefebvre     :Heli Support, Plopter LEDs
+ *  Roberto Navoni      :Library testing, Porting to VRBrain
+ *  Sandro Benigno      :Camera support, MinimOSD
+ *  Sandro Tognana      :PosHold flight mode
+ *  Sebastian Quilter   :SmartRTL
+ *  ..and many more.
+ *
+ *  Code commit statistics can be found here: https://github.com/ArduPilot/ardupilot/graphs/contributors
+ *  Wiki: https://plopter.ardupilot.org/
+ *
+ */
+
 #include "Plopter.h"
 
 #define FORCE_VERSION_H_INCLUDE
@@ -32,8 +86,7 @@ const AP_HAL::HAL& hal = AP_HAL::get_HAL();
 #define FAST_TASK(func) FAST_TASK_CLASS(Plopter, &plopter, func)
 
 /*
-  scheduler table - all regular tasks apart from the fast_loop()
-  should be listed here.
+  scheduler table - all tasks should be listed here.
 
   All entries in this table must be ordered by priority.
 
@@ -57,119 +110,146 @@ SCHED_TASK_CLASS arguments:
 
  */
 const AP_Scheduler::Task Plopter::scheduler_tasks[] = {
-    SCHED_TASK(rc_loop,              100,    130,  3),
-    SCHED_TASK(throttle_loop,         50,     75,  6),
-    SCHED_TASK_CLASS(AP_GPS,               &plopter.gps,                 update,          50, 200,   9),
+        // update INS immediately to get current gyro data populated
+        FAST_TASK_CLASS(AP_InertialSensor, &plopter.ins, update),
+        // run low level rate controllers that only require IMU data
+        FAST_TASK(run_rate_controller),
+        // send outputs to the motors library immediately
+        FAST_TASK(motors_output),
+        // run EKF state estimator (expensive)
+        FAST_TASK(read_AHRS),
+#if FRAME_CONFIG == HELI_FRAME
+        FAST_TASK(update_heli_control_dynamics),
+#if MODE_AUTOROTATE_ENABLED == ENABLED
+        FAST_TASK(heli_update_autorotation),
+#endif
+#endif //HELI_FRAME
+        // Inertial Nav
+        FAST_TASK(read_inertia),
+        // check if ekf has reset target heading or position
+        FAST_TASK(check_ekf_reset),
+        // run the attitude controllers
+        FAST_TASK(update_flight_mode),
+        // update home from EKF if necessary
+        FAST_TASK(update_home_from_EKF),
+        // check if we've landed or crashed
+        FAST_TASK(update_land_and_crash_detectors),
+#if HAL_MOUNT_ENABLED
+        // camera mount's fast update
+    FAST_TASK_CLASS(AP_Mount, &plopter.camera_mount, update_fast),
+#endif
+        FAST_TASK(Log_Video_Stabilisation),
+
+        SCHED_TASK(rc_loop,              100,    130,  3),
+        SCHED_TASK(throttle_loop,         50,     75,  6),
+        SCHED_TASK_CLASS(AP_GPS,               &plopter.gps,                 update,          50, 200,   9),
 #if AP_OPTICALFLOW_ENABLED
-    SCHED_TASK_CLASS(OpticalFlow,          &plopter.optflow,             update,         200, 160,  12),
+        SCHED_TASK_CLASS(OpticalFlow,          &plopter.optflow,             update,         200, 160,  12),
 #endif
-    SCHED_TASK(update_batt_compass,   10,    120, 15),
-    SCHED_TASK_CLASS(RC_Channels, (RC_Channels*)&plopter.g2.rc_channels, read_aux_all,    10,  50,  18),
-    SCHED_TASK(arm_motors_check,      10,     50, 21),
+        SCHED_TASK(update_batt_compass,   10,    120, 15),
+        SCHED_TASK_CLASS(RC_Channels, (RC_Channels*)&plopter.g2.rc_channels, read_aux_all,    10,  50,  18),
+        SCHED_TASK(arm_motors_check,      10,     50, 21),
 #if TOY_MODE_ENABLED == ENABLED
-    SCHED_TASK_CLASS(ToyMode,              &plopter.g2.toy_mode,         update,          10,  50,  24),
+        SCHED_TASK_CLASS(ToyMode,              &plopter.g2.toy_mode,         update,          10,  50,  24),
 #endif
-    SCHED_TASK(auto_disarm_check,     10,     50,  27),
-    SCHED_TASK(auto_trim,             10,     75,  30),
+        SCHED_TASK(auto_disarm_check,     10,     50,  27),
+        SCHED_TASK(auto_trim,             10,     75,  30),
 #if RANGEFINDER_ENABLED == ENABLED
-    SCHED_TASK(read_rangefinder,      20,    100,  33),
+        SCHED_TASK(read_rangefinder,      20,    100,  33),
 #endif
 #if HAL_PROXIMITY_ENABLED
-    SCHED_TASK_CLASS(AP_Proximity,         &plopter.g2.proximity,        update,         200,  50,  36),
+        SCHED_TASK_CLASS(AP_Proximity,         &plopter.g2.proximity,        update,         200,  50,  36),
 #endif
 #if BEACON_ENABLED == ENABLED
-    SCHED_TASK_CLASS(AP_Beacon,            &plopter.g2.beacon,           update,         400,  50,  39),
+        SCHED_TASK_CLASS(AP_Beacon,            &plopter.g2.beacon,           update,         400,  50,  39),
 #endif
-    SCHED_TASK(update_altitude,       10,    100,  42),
-    SCHED_TASK(run_nav_updates,       50,    100,  45),
-    SCHED_TASK(update_throttle_hover,100,     90,  48),
-#if MODE_SMARTRTL_ENABLED == ENABLED
-    SCHED_TASK_CLASS(ModeSmartRTL,         &plopter.mode_smartrtl,       save_position,    3, 100,  51),
-#endif
+        SCHED_TASK(update_altitude,       10,    100,  42),
+        SCHED_TASK(run_nav_updates,       50,    100,  45),
+        SCHED_TASK(update_throttle_hover,100,     90,  48),
 #if SPRAYER_ENABLED == ENABLED
-    SCHED_TASK_CLASS(AC_Sprayer,           &plopter.sprayer,               update,         3,  90,  54),
+        SCHED_TASK_CLASS(AC_Sprayer,           &plopter.sprayer,               update,         3,  90,  54),
 #endif
-    SCHED_TASK(three_hz_loop,          3,     75, 57),
-    SCHED_TASK_CLASS(AP_ServoRelayEvents,  &plopter.ServoRelayEvents,      update_events, 50,  75,  60),
-    SCHED_TASK_CLASS(AP_Baro,              &plopter.barometer,             accumulate,    50,  90,  63),
+        SCHED_TASK(three_hz_loop,          3,     75, 57),
+        SCHED_TASK_CLASS(AP_ServoRelayEvents,  &plopter.ServoRelayEvents,      update_events, 50,  75,  60),
+        SCHED_TASK_CLASS(AP_Baro,              &plopter.barometer,             accumulate,    50,  90,  63),
 #if AC_FENCE == ENABLED
-    SCHED_TASK_CLASS(AC_Fence,             &plopter.fence,                 update,        10, 100,  66),
+        SCHED_TASK_CLASS(AC_Fence,             &plopter.fence,                 update,        10, 100,  66),
 #endif
 #if PRECISION_LANDING == ENABLED
-    SCHED_TASK(update_precland,      400,     50,  69),
+        SCHED_TASK(update_precland,      400,     50,  69),
 #endif
 #if FRAME_CONFIG == HELI_FRAME
-    SCHED_TASK(check_dynamic_flight,  50,     75,  72),
+        SCHED_TASK(check_dynamic_flight,  50,     75,  72),
 #endif
 #if LOGGING_ENABLED == ENABLED
-    SCHED_TASK(fourhundred_hz_logging,400,    50,  75),
+        SCHED_TASK(fourhundred_hz_logging,400,    50,  75),
 #endif
-    SCHED_TASK_CLASS(AP_Notify,            &plopter.notify,              update,          50,  90,  78),
-    SCHED_TASK(one_hz_loop,            1,    100,  81),
-    SCHED_TASK(ekf_check,             10,     75,  84),
-    SCHED_TASK(check_vibration,       10,     50,  87),
-    SCHED_TASK(gpsglitch_check,       10,     50,  90),
+        SCHED_TASK_CLASS(AP_Notify,            &plopter.notify,              update,          50,  90,  78),
+        SCHED_TASK(one_hz_loop,            1,    100,  81),
+        SCHED_TASK(ekf_check,             10,     75,  84),
+        SCHED_TASK(check_vibration,       10,     50,  87),
+        SCHED_TASK(gpsglitch_check,       10,     50,  90),
 #if LANDING_GEAR_ENABLED == ENABLED
-    SCHED_TASK(landinggear_update,    10,     75,  93),
+        SCHED_TASK(landinggear_update,    10,     75,  93),
 #endif
-    SCHED_TASK(standby_update,        100,    75,  96),
-    SCHED_TASK(lost_vehicle_check,    10,     50,  99),
-    SCHED_TASK_CLASS(GCS,                  (GCS*)&plopter._gcs,          update_receive, 400, 180, 102),
-    SCHED_TASK_CLASS(GCS,                  (GCS*)&plopter._gcs,          update_send,    400, 550, 105),
+        SCHED_TASK(standby_update,        100,    75,  96),
+        SCHED_TASK(lost_vehicle_check,    10,     50,  99),
+        SCHED_TASK_CLASS(GCS,                  (GCS*)&plopter._gcs,          update_receive, 400, 180, 102),
+        SCHED_TASK_CLASS(GCS,                  (GCS*)&plopter._gcs,          update_send,    400, 550, 105),
 #if HAL_MOUNT_ENABLED
-    SCHED_TASK_CLASS(AP_Mount,             &plopter.camera_mount,        update,          50,  75, 108),
+        SCHED_TASK_CLASS(AP_Mount,             &plopter.camera_mount,        update,          50,  75, 108),
 #endif
 #if CAMERA == ENABLED
-    SCHED_TASK_CLASS(AP_Camera,            &plopter.camera,              update,          50,  75, 111),
+        SCHED_TASK_CLASS(AP_Camera,            &plopter.camera,              update,          50,  75, 111),
 #endif
 #if LOGGING_ENABLED == ENABLED
-    SCHED_TASK(ten_hz_logging_loop,   10,    350, 114),
-    SCHED_TASK(twentyfive_hz_logging, 25,    110, 117),
-    SCHED_TASK_CLASS(AP_Logger,            &plopter.logger,              periodic_tasks, 400, 300, 120),
+        SCHED_TASK(ten_hz_logging_loop,   10,    350, 114),
+        SCHED_TASK(twentyfive_hz_logging, 25,    110, 117),
+        SCHED_TASK_CLASS(AP_Logger,            &plopter.logger,              periodic_tasks, 400, 300, 120),
 #endif
-    SCHED_TASK_CLASS(AP_InertialSensor,    &plopter.ins,                 periodic,       400,  50, 123),
+        SCHED_TASK_CLASS(AP_InertialSensor,    &plopter.ins,                 periodic,       400,  50, 123),
 
-    SCHED_TASK_CLASS(AP_Scheduler,         &plopter.scheduler,           update_logging, 0.1,  75, 126),
+        SCHED_TASK_CLASS(AP_Scheduler,         &plopter.scheduler,           update_logging, 0.1,  75, 126),
 #if RPM_ENABLED == ENABLED
-    SCHED_TASK_CLASS(AP_RPM,               &plopter.rpm_sensor,          update,          40, 200, 129),
+        SCHED_TASK_CLASS(AP_RPM,               &plopter.rpm_sensor,          update,          40, 200, 129),
 #endif
-    SCHED_TASK_CLASS(Compass, &plopter.compass, cal_update, 100, 100, 132),
-    SCHED_TASK_CLASS(AP_TempCalibration,   &plopter.g2.temp_calibration, update,          10, 100, 135),
+        SCHED_TASK_CLASS(Compass, &plopter.compass, cal_update, 100, 100, 132),
+        SCHED_TASK_CLASS(AP_TempCalibration,   &plopter.g2.temp_calibration, update,          10, 100, 135),
 #if HAL_ADSB_ENABLED
-    SCHED_TASK(avoidance_adsb_update, 10,    100, 138),
+        SCHED_TASK(avoidance_adsb_update, 10,    100, 138),
 #endif
 #if ADVANCED_FAILSAFE == ENABLED
-    SCHED_TASK(afs_fs_check,          10,    100, 141),
+        SCHED_TASK(afs_fs_check,          10,    100, 141),
 #endif
 #if AP_TERRAIN_AVAILABLE
-    SCHED_TASK(terrain_update,        10,    100, 144),
+        SCHED_TASK(terrain_update,        10,    100, 144),
 #endif
 #if GRIPPER_ENABLED == ENABLED
-    SCHED_TASK_CLASS(AP_Gripper,           &plopter.g2.gripper,          update,          10,  75, 147),
+        SCHED_TASK_CLASS(AP_Gripper,           &plopter.g2.gripper,          update,          10,  75, 147),
 #endif
 #if WINCH_ENABLED == ENABLED
-    SCHED_TASK_CLASS(AP_Winch,             &plopter.g2.winch,            update,          50,  50, 150),
+        SCHED_TASK_CLASS(AP_Winch,             &plopter.g2.winch,            update,          50,  50, 150),
 #endif
 #ifdef USERHOOK_FASTLOOP
-    SCHED_TASK(userhook_FastLoop,    100,     75, 153),
+        SCHED_TASK(userhook_FastLoop,    100,     75, 153),
 #endif
 #ifdef USERHOOK_50HZLOOP
-    SCHED_TASK(userhook_50Hz,         50,     75, 156),
+        SCHED_TASK(userhook_50Hz,         50,     75, 156),
 #endif
 #ifdef USERHOOK_MEDIUMLOOP
-    SCHED_TASK(userhook_MediumLoop,   10,     75, 159),
+        SCHED_TASK(userhook_MediumLoop,   10,     75, 159),
 #endif
 #ifdef USERHOOK_SLOWLOOP
-    SCHED_TASK(userhook_SlowLoop,      3.3,   75, 162),
+        SCHED_TASK(userhook_SlowLoop,      3.3,   75, 162),
 #endif
 #ifdef USERHOOK_SUPERSLOWLOOP
-    SCHED_TASK(userhook_SuperSlowLoop, 1,     75, 165),
+        SCHED_TASK(userhook_SuperSlowLoop, 1,     75, 165),
 #endif
 #if HAL_BUTTON_ENABLED
-    SCHED_TASK_CLASS(AP_Button,            &plopter.button,              update,           5, 100, 168),
+        SCHED_TASK_CLASS(AP_Button,            &plopter.button,              update,           5, 100, 168),
 #endif
 #if STATS_ENABLED == ENABLED
-    SCHED_TASK_CLASS(AP_Stats,             &plopter.g2.stats,            update,           1, 100, 171),
+        SCHED_TASK_CLASS(AP_Stats,             &plopter.g2.stats,            update,           1, 100, 171),
 #endif
 };
 
@@ -183,50 +263,6 @@ void Plopter::get_scheduler_tasks(const AP_Scheduler::Task *&tasks,
 }
 
 constexpr int8_t Plopter::_failsafe_priorities[7];
-
-// Main loop - 400hz
-void Plopter::fast_loop()
-{
-    // update INS immediately to get current gyro data populated
-    ins.update();
-
-    // run low level rate controllers that only require IMU data
-    attitude_control->rate_controller_run();
-
-    // send outputs to the motors library immediately
-    motors_output();
-
-    // run EKF state estimator (expensive)
-    // --------------------
-    read_AHRS();
-
-    // Inertial Nav
-    // --------------------
-    read_inertia();
-
-    // check if ekf has reset target heading or position
-    check_ekf_reset();
-
-    // run the attitude controllers
-    update_flight_mode();
-
-    // update home from EKF if necessary
-    update_home_from_EKF();
-
-    // check if we've landed or crashed
-    update_land_and_crash_detectors();
-
-    // log sensor health
-    if (should_log(MASK_LOG_ANY)) {
-        Log_Sensor_Health();
-    }
-
-    AP_Vehicle::fast_loop();
-
-    if (should_log(MASK_LOG_VIDEO_STABILISATION)) {
-        ahrs.write_video_stabilisation();
-    }
-}
 
 #if AP_SCRIPTING_ENABLED
 // start takeoff to given altitude (for use by scripting)
@@ -379,6 +415,12 @@ void Plopter::nav_script_time_done(uint16_t id)
     return mode_auto.nav_script_time_done(id);
 }
 
+// returns true if the EKF failsafe has triggered.  Only used by Lua scripts
+bool Plopter::has_ekf_failsafed() const
+{
+    return failsafe.ekf;
+}
+
 #endif // AP_SCRIPTING_ENABLED
 
 
@@ -472,10 +514,10 @@ void Plopter::ten_hz_logging_loop()
     if (should_log(MASK_LOG_CTUN)) {
         attitude_control->control_monitor_log();
 #if HAL_PROXIMITY_ENABLED
-        logger.Write_Proximity(g2.proximity);  // Write proximity sensor distances
+        g2.proximity.log();  // Write proximity sensor distances
 #endif
 #if BEACON_ENABLED == ENABLED
-        logger.Write_Beacon(g2.beacon);
+        g2.beacon.log();
 #endif
     }
 #if FRAME_CONFIG == HELI_FRAME
@@ -516,6 +558,9 @@ void Plopter::three_hz_loop()
     // check if we've lost terrain data
     failsafe_terrain_check();
 
+    // check for deadreckoning failsafe
+    failsafe_deadreckon_check();
+
 #if AC_FENCE == ENABLED
     // check if we have breached a fence
     fence_check();
@@ -536,12 +581,7 @@ void Plopter::one_hz_loop()
         Log_Write_Data(LogDataID::AP_STATE, ap.value);
     }
 
-    arming.update();
-
     if (!motors->armed()) {
-        // make it possible to change ahrs orientation at runtime during initial config
-        ahrs.update_orientation();
-
         update_using_interlock();
 
         // check the user hasn't updated the frame class or type
@@ -686,19 +726,16 @@ bool Plopter::get_wp_crosstrack_error_m(float &xtrack_error) const
   constructor for main Plopter class
  */
 Plopter::Plopter(void)
-    : logger(g.log_bitmask),
-    flight_modes(&g.flight_mode1),
-    simple_cos_yaw(1.0f),
-    super_simple_cos_yaw(1.0),
-    land_accel_ef_filter(LAND_DETECTOR_ACCEL_LPF_CUTOFF),
-    rc_throttle_control_in_filter(1.0f),
-    inertial_nav(ahrs),
-    param_loader(var_info),
-    flightmode(&mode_stabilize)
+        : logger(g.log_bitmask),
+          flight_modes(&g.flight_mode1),
+          simple_cos_yaw(1.0f),
+          super_simple_cos_yaw(1.0),
+          land_accel_ef_filter(LAND_DETECTOR_ACCEL_LPF_CUTOFF),
+          rc_throttle_control_in_filter(1.0f),
+          inertial_nav(ahrs),
+          param_loader(var_info),
+          flightmode(&mode_stabilize)
 {
-    // init sensor error logging flags
-    sensor_health.baro = true;
-    sensor_health.compass = true;
 }
 
 Plopter plopter;

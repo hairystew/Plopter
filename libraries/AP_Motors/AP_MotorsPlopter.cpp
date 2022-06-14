@@ -13,41 +13,39 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+ *       AP_MotorsPlopter.cpp - ArduCopter motors library for tailsitters and bicopters
+ *
+ */
+
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Math/AP_Math.h>
-#include <GCS_MAVLink/GCS.h>
 #include "AP_MotorsPlopter.h"
+#include <GCS_MAVLink/GCS.h>
 
 extern const AP_HAL::HAL& hal;
+
+#define SERVO_OUTPUT_RANGE  4500
 
 // init
 void AP_MotorsPlopter::init(motor_frame_class frame_class, motor_frame_type frame_type)
 {
-    //adding two motors
-    add_motor_num(AP_MOTORS_MOT_1);
-    add_motor_num(AP_MOTORS_MOT_2);
+    // setup default motor and servo mappings
+    _has_diff_thrust = SRV_Channels::function_assigned(SRV_Channel::k_throttleRight) || SRV_Channels::function_assigned(SRV_Channel::k_throttleLeft);
 
-    //adding two servos
+    // right throttle defaults to servo output 1
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_throttleRight, CH_1);
 
+    // left throttle defaults to servo output 2
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_throttleLeft, CH_2);
 
-    // set update rate for the 2 motors
-    set_update_rate(_speed_hz);
+    // right servo defaults to servo output 3
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_tiltMotorRight, CH_3);
+    SRV_Channels::set_angle(SRV_Channel::k_tiltMotorRight, SERVO_OUTPUT_RANGE);
 
-    // set the motor_enabled flag so that the ESCs can be calibrated like other frame types
-    motor_enabled[AP_MOTORS_MOT_1] = true;
-    motor_enabled[AP_MOTORS_MOT_2] = true;
-
-    // allow mapping of motor 3 and 4
-    add_motor_num(AP_MOTORS_PLOPTER_RIGHT);
-    add_motor_num(AP_MOTORS_PLOPTER_LEFT);
-
-    SRV_Channels::set_angle(SRV_Channels::get_motor_function(AP_MOTORS_PLOPTER_RIGHT), _yaw_servo_angle_max_deg*100);
-    SRV_Channels::set_angle(SRV_Channels::get_motor_function(AP_MOTORS_PLOPTER_LEFT), _yaw_servo_angle_max_deg*100);
-
-    // check for reverse tricopter
-    if (frame_type == MOTOR_FRAME_TYPE_PLUSREV) {
-        _pitch_reversed = true;
-    }
+    // left servo defaults to servo output 4
+    SRV_Channels::set_aux_channel_default(SRV_Channel::k_tiltMotorLeft, CH_4);
+    SRV_Channels::set_angle(SRV_Channel::k_tiltMotorLeft, SERVO_OUTPUT_RANGE);
 
     _mav_type = MAV_TYPE_PLOPTER;
 
@@ -55,18 +53,14 @@ void AP_MotorsPlopter::init(motor_frame_class frame_class, motor_frame_type fram
     set_initialised_ok(frame_class == MOTOR_FRAME_PLOPTER);
 }
 
-// set frame class (i.e. quad, hexa, heli) and type (i.e. x, plus)
-void AP_MotorsPlopter::set_frame_class_and_type(motor_frame_class frame_class, motor_frame_type frame_type)
-{
-    // check for reverse plopter (IDK what this does)
-    if (frame_type == MOTOR_FRAME_TYPE_PLUSREV) {
-        _pitch_reversed = true;
-    } else {
-        _pitch_reversed = false;
-    }
 
-    set_initialised_ok((frame_class == MOTOR_FRAME_PLOPTER) && SRV_Channels::function_assigned(SRV_Channel::k_motor3) && SRV_Channels::function_assigned(SRV_Channel::k_motor4));
+/// Constructor
+AP_MotorsPlopter::AP_MotorsPlopter(uint16_t loop_rate, uint16_t speed_hz) :
+        AP_MotorsMulticopter(loop_rate, speed_hz)
+{
+    set_update_rate(speed_hz);
 }
+
 
 // set update rate to motors - a value in hertz
 void AP_MotorsPlopter::set_update_rate(uint16_t speed_hz)
@@ -74,206 +68,149 @@ void AP_MotorsPlopter::set_update_rate(uint16_t speed_hz)
     // record requested speed
     _speed_hz = speed_hz;
 
-    // set update rate for the 3 motors (but not the servo on channels 3 & 4)
-    uint32_t mask =
-            1U << AP_MOTORS_MOT_1 |
-            1U << AP_MOTORS_MOT_2 ;
-    rc_set_freq(mask, _speed_hz);
+    SRV_Channels::set_rc_frequency(SRV_Channel::k_throttleLeft, speed_hz);
+    SRV_Channels::set_rc_frequency(SRV_Channel::k_throttleRight, speed_hz);
 }
 
 void AP_MotorsPlopter::output_to_motors()
 {
+    if (!initialised_ok()) {
+        return;
+    }
+
     switch (_spool_state) {
         case SpoolState::SHUT_DOWN:
-            // sends minimum values out to the motors
-            rc_write(AP_MOTORS_MOT_1, output_to_pwm(0));
-            rc_write(AP_MOTORS_MOT_2, output_to_pwm(0));
-            //HRS
-            rc_write_angle(AP_MOTORS_PLOPTER_RIGHT, 0);
-            rc_write_angle(AP_MOTORS_PLOPTER_LEFT, 0);
+            _actuator[0] = 0.0f;
+            _actuator[1] = 0.0f;
+            _actuator[2] = 0.0f;
+            _external_min_throttle = 0.0;
             break;
         case SpoolState::GROUND_IDLE:
-            // sends output to motors when armed but not flying
+            set_actuator_with_slew(_actuator[0], actuator_spin_up_to_ground_idle());
             set_actuator_with_slew(_actuator[1], actuator_spin_up_to_ground_idle());
             set_actuator_with_slew(_actuator[2], actuator_spin_up_to_ground_idle());
-            rc_write(AP_MOTORS_MOT_1, output_to_pwm(_actuator[1]));
-            rc_write(AP_MOTORS_MOT_2, output_to_pwm(_actuator[2]));\
-            //HRS
-            rc_write_angle(AP_MOTORS_PLOPTER_RIGHT, 0);
-            rc_write_angle(AP_MOTORS_PLOPTER_LEFT, 0);
+            _external_min_throttle = 0.0;
             break;
         case SpoolState::SPOOLING_UP:
         case SpoolState::THROTTLE_UNLIMITED:
         case SpoolState::SPOOLING_DOWN:
-            // set motor output based on thrust requests
+            set_actuator_with_slew(_actuator[0], thrust_to_actuator(_thrust_left));
             set_actuator_with_slew(_actuator[1], thrust_to_actuator(_thrust_right));
-            set_actuator_with_slew(_actuator[2], thrust_to_actuator(_thrust_left));
-            rc_write(AP_MOTORS_MOT_1, output_to_pwm(_actuator[1]));
-            rc_write(AP_MOTORS_MOT_2, output_to_pwm(_actuator[2]));
-            //HRS
-            rc_write_angle(AP_MOTORS_PLOPTER_RIGHT, degrees(_pivot_angle)*100);
-            rc_write_angle(AP_MOTORS_PLOPTER_LEFT, degrees(_pivot_angle)*100);
+            set_actuator_with_slew(_actuator[2], thrust_to_actuator(_throttle));
             break;
     }
+
+    SRV_Channels::set_output_pwm(SRV_Channel::k_throttleLeft, output_to_pwm(_actuator[0]));
+    SRV_Channels::set_output_pwm(SRV_Channel::k_throttleRight, output_to_pwm(_actuator[1]));
+
+    // use set scaled to allow a different PWM range on plane forward throttle, throttle range is 0 to 100
+    SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, _actuator[2]*100);
+
+    SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorLeft, _tilt_left*SERVO_OUTPUT_RANGE);
+    SRV_Channels::set_output_scaled(SRV_Channel::k_tiltMotorRight, _tilt_right*SERVO_OUTPUT_RANGE);
+
 }
 
-// get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+// get_motor_mask - returns a bitmask of which outputs are being used for motors (1 means being used)
 //  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
-uint16_t AP_MotorsPlopter::get_motor_mask()
+uint32_t AP_MotorsPlopter::get_motor_mask()
 {
-    // plopter uses channels 1,2,3 and 4
-    uint16_t motor_mask = (1U << AP_MOTORS_MOT_1) |
-                          (1U << AP_MOTORS_MOT_2);
-    uint16_t mask = motor_mask_to_srv_channel_mask(motor_mask);
+    uint32_t motor_mask = 0;
+    uint8_t chan;
+    if (SRV_Channels::find_channel(SRV_Channel::k_throttleLeft, chan)) {
+        motor_mask |= 1U << chan;
+    }
+    if (SRV_Channels::find_channel(SRV_Channel::k_throttleRight, chan)) {
+        motor_mask |= 1U << chan;
+    }
 
     // add parent's mask
-    mask |= AP_MotorsMulticopter::get_motor_mask();
+    motor_mask |= AP_MotorsMulticopter::get_motor_mask();
 
-    return mask;
+    return motor_mask;
 }
 
-// output_armed - sends commands to the motors
-// includes new scaling stability patch
+// calculate outputs to the motors
 void AP_MotorsPlopter::output_armed_stabilizing()
 {
     float   roll_thrust;                // roll thrust input value, +/- 1.0
     float   pitch_thrust;               // pitch thrust input value, +/- 1.0
     float   yaw_thrust;                 // yaw thrust input value, +/- 1.0
     float   throttle_thrust;            // throttle thrust input value, 0.0 - 1.0
-    float   throttle_avg_max;           // throttle thrust average maximum value, 0.0 - 1.0
-    float   throttle_thrust_best_rpy;   // throttle providing maximum roll, pitch and yaw range without climbing
-    float   rpy_scale = 1.0f;           // this is used to scale the roll, pitch and yaw to fit within the motor limits
-    float   rpy_low = 0.0f;             // lowest motor value
-    float   rpy_high = 0.0f;            // highest motor value
-    float   thr_adj;                    // the difference between the pilot's desired throttle and throttle_thrust_best_rpy
-
-    SRV_Channels::set_angle(SRV_Channels::get_motor_function(AP_MOTORS_PLOPTER_RIGHT), _yaw_servo_angle_max_deg*100);
-    SRV_Channels::set_angle(SRV_Channels::get_motor_function(AP_MOTORS_PLOPTER_LEFT), _yaw_servo_angle_max_deg*100);
-
-    // sanity check YAW_SV_ANGLE parameter value to avoid divide by zero
-    //leave this for now, may make custom parameters HRS
-    _yaw_servo_angle_max_deg = constrain_float(_yaw_servo_angle_max_deg, AP_MOTORS_TRI_SERVO_RANGE_DEG_MIN, AP_MOTORS_TRI_SERVO_RANGE_DEG_MAX);
+    float   thrust_max;                 // highest motor value
+    float   thrust_min;                 // lowest motor value
+    float   thr_adj = 0.0f;             // the difference between the pilot's desired throttle and throttle_thrust_best_rpy
 
     // apply voltage and air pressure compensation
     const float compensation_gain = get_compensation_gain();
     roll_thrust = (_roll_in + _roll_in_ff) * compensation_gain;
-    pitch_thrust = (_pitch_in + _pitch_in_ff) * compensation_gain;
-    yaw_thrust = (_yaw_in + _yaw_in_ff) * compensation_gain * sinf(radians(_yaw_servo_angle_max_deg)); // we scale this so a thrust request of 1.0f will ask for full servo deflection at full rear throttle
+    pitch_thrust = _pitch_in + _pitch_in_ff;
+    yaw_thrust = _yaw_in + _yaw_in_ff;
     throttle_thrust = get_throttle() * compensation_gain;
-    throttle_avg_max = _throttle_avg_max * compensation_gain;
+    const float max_boost_throttle = _throttle_avg_max * compensation_gain;
 
-    // check for reversed pitch
-    if (_pitch_reversed) {
-        pitch_thrust *= -1.0f;
-    }
+    // never boost above max, derived from throttle mix params
+    const float min_throttle_out = MIN(_external_min_throttle, max_boost_throttle);
+    const float max_throttle_out = _throttle_thrust_max * compensation_gain;
 
-    // calculate angle of yaw pivot
-    _pivot_angle = safe_asin(yaw_thrust);
-    if (fabsf(_pivot_angle) > radians(_yaw_servo_angle_max_deg)) {
-        limit.yaw = true;
-        _pivot_angle = constrain_float(_pivot_angle, -radians(_yaw_servo_angle_max_deg), radians(_yaw_servo_angle_max_deg));
-    }
-
-    float pivot_thrust_max = cosf(_pivot_angle);
-    float thrust_max = 1.0f;
-
-    // sanity check throttle is above zero and below current limited throttle
-    if (throttle_thrust <= 0.0f) {
-        throttle_thrust = 0.0f;
+    // sanity check throttle is above min and below current limited throttle
+    if (throttle_thrust <= min_throttle_out) {
+        throttle_thrust = min_throttle_out;
         limit.throttle_lower = true;
     }
-    if (throttle_thrust >= _throttle_thrust_max) {
-        throttle_thrust = _throttle_thrust_max;
+    if (throttle_thrust >= max_throttle_out) {
+        throttle_thrust = max_throttle_out;
         limit.throttle_upper = true;
     }
 
-    //HRS COME BACK AND CORRECT MOTOR MIXING
-
-
-    throttle_avg_max = constrain_float(throttle_avg_max, throttle_thrust, _throttle_thrust_max);
-
-    // The following mix may be offer less coupling between axis but needs testing
-    //_thrust_right = roll_thrust * -0.5f + pitch_thrust * 1.0f;
-    //_thrust_left = roll_thrust * 0.5f + pitch_thrust * 1.0f;
-    //_thrust_rear = 0;
-
-    _thrust_right = roll_thrust * -0.5f + pitch_thrust * 0.5f;
-    _thrust_left = roll_thrust * 0.5f + pitch_thrust * 0.5f;
-    _thrust_rear = pitch_thrust * -0.5f;
-
-    // calculate roll and pitch for each motor
-    // set rpy_low and rpy_high to the lowest and highest values of the motors
-
-    // record lowest roll pitch command
-    rpy_low = MIN(_thrust_right, _thrust_left);
-    rpy_high = MAX(_thrust_right, _thrust_left);
-    if (rpy_low > _thrust_rear) {
-        rpy_low = _thrust_rear;
-    }
-    // check to see if the rear motor will reach maximum thrust before the front two motors
-    if ((1.0f - rpy_high) > (pivot_thrust_max - _thrust_rear)) {
-        thrust_max = pivot_thrust_max;
-        rpy_high = _thrust_rear;
-    }
-
-    // calculate throttle that gives most possible room for yaw (range 1000 ~ 2000) which is the lower of:
-    //      1. 0.5f - (rpy_low+rpy_high)/2.0 - this would give the maximum possible room margin above the highest motor and below the lowest
-    //      2. the higher of:
-    //            a) the pilot's throttle input
-    //            b) the point _throttle_rpy_mix between the pilot's input throttle and hover-throttle
-    //      Situation #2 ensure we never increase the throttle above hover throttle unless the pilot has commanded this.
-    //      Situation #2b allows us to raise the throttle above what the pilot commanded but not so far that it would actually cause the copter to rise.
-    //      We will choose #1 (the best throttle for yaw control) if that means reducing throttle to the motors (i.e. we favor reducing throttle *because* it provides better yaw control)
-    //      We will choose #2 (a mix of pilot and hover throttle) only when the throttle is quite low.  We favor reducing throttle instead of better yaw control because the pilot has commanded it
-
-    // check everything fits
-    throttle_thrust_best_rpy = MIN(0.5f * thrust_max - (rpy_low + rpy_high) / 2.0, throttle_avg_max);
-    if (is_zero(rpy_low)) {
-        rpy_scale = 1.0f;
-    } else {
-        rpy_scale = constrain_float(-throttle_thrust_best_rpy / rpy_low, 0.0f, 1.0f);
-    }
-
-    // calculate how close the motors can come to the desired throttle
-    thr_adj = throttle_thrust - throttle_thrust_best_rpy;
-    if (rpy_scale < 1.0f) {
-        // Full range is being used by roll, pitch, and yaw.
+    if (roll_thrust >= 1.0) {
+        // cannot split motor outputs by more than 1
+        roll_thrust = 1;
         limit.roll = true;
-        limit.pitch = true;
-        if (thr_adj > 0.0f) {
-            limit.throttle_upper = true;
-        }
-        thr_adj = 0.0f;
-    } else {
-        if (thr_adj < -(throttle_thrust_best_rpy + rpy_low)) {
-            // Throttle can't be reduced to desired value
-            thr_adj = -(throttle_thrust_best_rpy + rpy_low);
-        } else if (thr_adj > thrust_max - (throttle_thrust_best_rpy + rpy_high)) {
-            // Throttle can't be increased to desired value
-            thr_adj = thrust_max - (throttle_thrust_best_rpy + rpy_high);
-            limit.throttle_upper = true;
-        }
     }
 
-    // determine throttle thrust for harmonic notch
-    const float throttle_thrust_best_plus_adj = throttle_thrust_best_rpy + thr_adj;
+    // calculate left and right throttle outputs
+    _thrust_left  = throttle_thrust + roll_thrust * 0.5f;
+    _thrust_right = throttle_thrust - roll_thrust * 0.5f;
+
+    thrust_max = MAX(_thrust_right,_thrust_left);
+    thrust_min = MIN(_thrust_right,_thrust_left);
+    if (thrust_max > 1.0f) {
+        // if max thrust is more than one reduce average throttle
+        thr_adj = 1.0f - thrust_max;
+        limit.throttle_upper = true;
+    } else if (thrust_min < 0.0) {
+        // if min thrust is less than 0 increase average throttle
+        // but never above max boost
+        thr_adj = -thrust_min;
+        if ((throttle_thrust + thr_adj) > max_boost_throttle) {
+            thr_adj = MAX(max_boost_throttle - throttle_thrust, 0.0);
+            // in this case we throw away some roll output, it will be uneven
+            // constraining the lower motor more than the upper
+            // this unbalances torque, but motor torque should have significantly less control power than tilts / control surfaces
+            // so its worth keeping the higher roll control power at a minor cost to yaw
+            limit.roll = true;
+        }
+        limit.throttle_lower = true;
+    }
+
+    // Add adjustment to reduce average throttle
+    _thrust_left  = constrain_float(_thrust_left  + thr_adj, 0.0f, 1.0f);
+    _thrust_right = constrain_float(_thrust_right + thr_adj, 0.0f, 1.0f);
+
+    _throttle = throttle_thrust;
+
     // compensation_gain can never be zero
-    _throttle_out = throttle_thrust_best_plus_adj / compensation_gain;
+    // ensure accurate representation of average throttle output, this value is used for notch tracking and control surface scaling
+    if (_has_diff_thrust) {
+        _throttle_out = (throttle_thrust + thr_adj) / compensation_gain;
+    } else {
+        _throttle_out = throttle_thrust / compensation_gain;
+    }
 
-    // add scaled roll, pitch, constrained yaw and throttle for each motor
-    _thrust_right = throttle_thrust_best_plus_adj + rpy_scale * _thrust_right;
-    _thrust_left = throttle_thrust_best_plus_adj + rpy_scale * _thrust_left;
-    _thrust_rear = throttle_thrust_best_plus_adj + rpy_scale * _thrust_rear;
-
-    // scale pivot thrust to account for pivot angle
-    // we should not need to check for divide by zero as _pivot_angle is constrained to the 5deg ~ 80 deg range
-    _thrust_rear = _thrust_rear / cosf(_pivot_angle);
-
-    // constrain all outputs to 0.0f to 1.0f
-    // test code should be run with these lines commented out as they should not do anything
-    _thrust_right = constrain_float(_thrust_right, 0.0f, 1.0f);
-    _thrust_left = constrain_float(_thrust_left, 0.0f, 1.0f);
-    _thrust_rear = constrain_float(_thrust_rear, 0.0f, 1.0f);
+    // thrust vectoring
+    _tilt_left  = pitch_thrust - yaw_thrust;
+    _tilt_right = pitch_thrust + yaw_thrust;
 }
 
 // output_test_seq - spin a motor at the pwm value specified
@@ -281,79 +218,26 @@ void AP_MotorsPlopter::output_armed_stabilizing()
 //  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
 void AP_MotorsPlopter::_output_test_seq(uint8_t motor_seq, int16_t pwm)
 {
-    //HRS
     // output to motors and servos
     switch (motor_seq) {
         case 1:
-            // front right motor
-            rc_write(AP_MOTORS_MOT_1, pwm);
+            // right throttle
+            SRV_Channels::set_output_pwm(SRV_Channel::k_throttleRight, pwm);
             break;
         case 2:
-            // back motor
-            rc_write(AP_MOTORS_MOT_4, pwm);
+            // right tilt servo
+            SRV_Channels::set_output_pwm(SRV_Channel::k_tiltMotorRight, pwm);
             break;
         case 3:
-            //Right Servo
-            rc_write(AP_MOTORS_PLOPTER_RIGHT, pwm);
+            // left throttle
+            SRV_Channels::set_output_pwm(SRV_Channel::k_throttleLeft, pwm);
             break;
         case 4:
-            //Left Servo
-            rc_write(AP_MOTORS_PLOPTER_LEFT, pwm);
+            // left tilt servo
+            SRV_Channels::set_output_pwm(SRV_Channel::k_tiltMotorLeft, pwm);
             break;
         default:
             // do nothing
             break;
     }
-}
-
-/*
-  call vehicle supplied thrust compensation if set. This allows for
-  vehicle specific thrust compensation for motor arrangements such as
-  the forward motors tilting
-*/
-void AP_MotorsPlopter::thrust_compensation(void)
-{
-    if (_thrust_compensation_callback) {
-        // convert 3 thrust values into an array indexed by motor number
-        float thrust[4] { _thrust_right, _thrust_left, 0, _thrust_rear };
-
-        // apply vehicle supplied compensation function
-        _thrust_compensation_callback(thrust, 4);
-
-        // extract compensated thrust values
-        _thrust_right = thrust[0];
-        _thrust_left = thrust[1];
-        _thrust_rear = thrust[3];
-    }
-}
-
-/*
-  override tricopter tail servo output in output_motor_mask (idk what this does, not tri anymore)
- */
-void AP_MotorsPlopter::output_motor_mask(float thrust, uint8_t mask, float rudder_dt)
-{
-    // normal multicopter output
-    AP_MotorsMulticopter::output_motor_mask(thrust, mask, rudder_dt);
-
-    // and override yaw servo
-    rc_write_angle(AP_MOTORS_PLOPTER_RIGHT, 0);
-    rc_write_angle(AP_MOTORS_PLOPTER_LEFT, 0);
-}
-
-float AP_MotorsPlopter::get_roll_factor(uint8_t i)
-{
-    float ret = 0.0f;
-
-    switch (i) {
-        // right motor
-        case AP_MOTORS_MOT_1:
-            ret = -1.0f;
-            break;
-            // left motor
-        case AP_MOTORS_MOT_2:
-            ret = 1.0f;
-            break;
-    }
-
-    return ret;
 }

@@ -63,6 +63,9 @@ bool AP_MotorsMatrix::init(uint8_t expected_num_motors)
     }
 
     switch (num_motors) {
+        case 2:
+            _mav_type = MAV_TYPE_PLOPTER;
+            break;
         case 3:
             _mav_type = MAV_TYPE_TRICOPTER;
             break;
@@ -1212,6 +1215,33 @@ void AP_MotorsMatrix::setup_motors(motor_frame_class frame_class, motor_frame_ty
             }
             break;
 #endif //AP_MOTORS_FRAME_DECA_ENABLED
+        case MOTOR_FRAME_PLOPTER:
+            _mav_type = MAV_TYPE_PLOPTER;
+            _frame_class_string = "PLOPTER";
+            switch (frame_type) {
+                case MOTOR_FRAME_PLOPTER: {
+                    _frame_type_string = "PLUS";
+                    static const AP_MotorsMatrix::MotorDef motors[] {
+                            {    0, AP_MOTORS_MATRIX_YAW_FACTOR_CCW,   1 },
+                            {   36, AP_MOTORS_MATRIX_YAW_FACTOR_CW,    2 },
+                            {   72, AP_MOTORS_MATRIX_YAW_FACTOR_CCW,   3 },
+                            {  108, AP_MOTORS_MATRIX_YAW_FACTOR_CW,    4 },
+                            {  144, AP_MOTORS_MATRIX_YAW_FACTOR_CCW,   5 },
+                            {  180, AP_MOTORS_MATRIX_YAW_FACTOR_CW,    6 },
+                            { -144, AP_MOTORS_MATRIX_YAW_FACTOR_CCW,   7 },
+                            { -108, AP_MOTORS_MATRIX_YAW_FACTOR_CW,    8 },
+                            {  -72, AP_MOTORS_MATRIX_YAW_FACTOR_CCW,   9 },
+                            {  -36, AP_MOTORS_MATRIX_YAW_FACTOR_CW,   10 },
+                    };
+                    add_motors(motors, ARRAY_SIZE(motors));
+                    break;
+                }
+                default:
+                    // deca frame class does not support this frame type
+                    success = false;
+                    break;
+            }
+            break;
         default:
             // matrix doesn't support the configured class
             _frame_class_string = "UNSUPPORTED";

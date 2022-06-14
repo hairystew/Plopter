@@ -133,11 +133,6 @@ Mode *Plopter::mode_from_mode_num(const Mode::Number mode)
             break;
 #endif
 
-#if MODE_SMARTRTL_ENABLED == ENABLED
-        case Mode::Number::SMART_RTL:
-            ret = &mode_smartrtl;
-            break;
-#endif
 
 #if AP_OPTICALFLOW_ENABLED
         case Mode::Number::FLOWHOLD:

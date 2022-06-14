@@ -155,7 +155,7 @@ public:
         k_param_precland = 74,
 
         //
-        // 75: Singlecopter, CoaxCopter
+        // 75: Singleplopter, CoaxPlopter
         //
         k_param_single_servo_1 = 75,    // remove
         k_param_single_servo_2,         // remove
@@ -250,7 +250,7 @@ public:
         k_param_rangefinder_type_old,     // deprecated
         k_param_super_simple = 155,
         k_param_axis_enabled = 157, // deprecated - remove with next eeprom number change
-        k_param_copter_leds_mode,   // deprecated - remove with next eeprom number change
+        k_param_plopter_leds_mode,   // deprecated - remove with next eeprom number change
         k_param_ahrs, // AHRS group // 159
 
         //
@@ -533,7 +533,7 @@ public:
     
 #if ADVANCED_FAILSAFE == ENABLED
     // advanced failsafe library
-    AP_AdvancedFailsafe_Copter afs;
+    AP_AdvancedFailsafe_Plopter afs;
 #endif
 
     // developer options
@@ -549,7 +549,7 @@ public:
     AP_Int8 frame_class;
 
     // RC input channels
-    RC_Channels_Copter rc_channels;
+    RC_Channels_Plopter rc_channels;
     
     // control over servo output ranges
     SRV_Channels servo_channels;
@@ -606,10 +606,6 @@ public:
     AP_OAPathPlanner oa;
 #endif
 
-#if MODE_SYSTEMID_ENABLED == ENABLED
-    // we need a pointer to the mode for the G2 table
-    void *mode_systemid_ptr;
-#endif
 
     // vibration failsafe enable/disable
     AP_Int8 fs_vibe_enabled;
@@ -622,10 +618,6 @@ public:
     AC_Autorotation arot;
 #endif
 
-#if MODE_ZIGZAG_ENABLED == ENABLED
-    // we need a pointer to the mode for the G2 table
-    void *mode_zigzag_ptr;
-#endif
 
 #if MODE_ACRO_ENABLED == ENABLED
     AP_Int8 acro_options;

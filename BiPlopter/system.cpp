@@ -49,7 +49,7 @@ void Plopter::init_ardupilot()
 
     // Init RSSI
     rssi.init();
-    
+
     barometer.init();
 
     // setup telem slots with serial ports
@@ -233,78 +233,6 @@ void Plopter::startup_INS_ground()
     ahrs.reset();
 }
 
-// update the harmonic notch filter center frequency dynamically
-void Plopter::update_dynamic_notch()
-{
-    if (!ins.gyro_harmonic_notch_enabled()) {
-        return;
-    }
-    const float ref_freq = ins.get_gyro_harmonic_notch_center_freq_hz();
-    const float ref = ins.get_gyro_harmonic_notch_reference();
-    if (is_zero(ref)) {
-        ins.update_harmonic_notch_freq_hz(ref_freq);
-        return;
-    }
-
-    const float throttle_freq = ref_freq * MAX(1.0f, sqrtf(motors->get_throttle_out() / ref));
-
-    switch (ins.get_gyro_harmonic_notch_tracking_mode()) {
-        case HarmonicNotchDynamicMode::UpdateThrottle: // throttle based tracking
-            // set the harmonic notch filter frequency approximately scaled on motor rpm implied by throttle
-            ins.update_harmonic_notch_freq_hz(throttle_freq);
-            break;
-
-#if RPM_ENABLED == ENABLED
-        case HarmonicNotchDynamicMode::UpdateRPM: // rpm sensor based tracking
-            float rpm;
-            if (rpm_sensor.get_rpm(0, rpm)) {
-                // set the harmonic notch filter frequency from the main rotor rpm
-                ins.update_harmonic_notch_freq_hz(MAX(ref_freq, rpm * ref / 60.0f));
-            } else {
-                ins.update_harmonic_notch_freq_hz(ref_freq);
-            }
-            break;
-#endif
-#if HAL_WITH_ESC_TELEM
-        case HarmonicNotchDynamicMode::UpdateBLHeli: // BLHeli based tracking
-            // set the harmonic notch filter frequency scaled on measured frequency
-            if (ins.has_harmonic_option(HarmonicNotchFilterParams::Options::DynamicHarmonic)) {
-                float notches[INS_MAX_NOTCHES];
-                const uint8_t num_notches = AP::esc_telem().get_motor_frequencies_hz(ins.get_num_gyro_dynamic_notches(), notches);
-
-                for (uint8_t i = 0; i < num_notches; i++) {
-                    notches[i] =  MAX(ref_freq, notches[i]);
-                }
-                if (num_notches > 0) {
-                    ins.update_harmonic_notch_frequencies_hz(num_notches, notches);
-                } else {    // throttle fallback
-                    ins.update_harmonic_notch_freq_hz(throttle_freq);
-                }
-            } else {
-                ins.update_harmonic_notch_freq_hz(MAX(ref_freq, AP::esc_telem().get_average_motor_frequency_hz() * ref));
-            }
-            break;
-#endif
-#if HAL_GYROFFT_ENABLED
-        case HarmonicNotchDynamicMode::UpdateGyroFFT: // FFT based tracking
-            // set the harmonic notch filter frequency scaled on measured frequency
-            if (ins.has_harmonic_option(HarmonicNotchFilterParams::Options::DynamicHarmonic)) {
-                float notches[INS_MAX_NOTCHES];
-                const uint8_t peaks = gyro_fft.get_weighted_noise_center_frequencies_hz(ins.get_num_gyro_dynamic_notches(), notches);
-
-                ins.update_harmonic_notch_frequencies_hz(peaks, notches);
-            } else {
-                ins.update_harmonic_notch_freq_hz(gyro_fft.get_weighted_noise_center_freq_hz());
-            }
-            break;
-#endif
-        case HarmonicNotchDynamicMode::Fixed: // static
-        default:
-            ins.update_harmonic_notch_freq_hz(ref_freq);
-            break;
-    }
-}
-
 // position_ok - returns true if the horizontal absolute position is ok and home position is set
 bool Plopter::position_ok() const
 {
@@ -345,7 +273,7 @@ bool Plopter::ekf_has_relative_position() const
         return false;
     }
 
-    // return immediately if neither optflow nor visual odometry is enabled
+    // return immediately if neither optflow nor visual odometry is enabled and dead reckoning is inactive
     bool enabled = false;
 #if AP_OPTICALFLOW_ENABLED
     if (optflow.enabled()) {
@@ -357,6 +285,9 @@ bool Plopter::ekf_has_relative_position() const
         enabled = true;
     }
 #endif
+    if (dead_reckoning.active && !dead_reckoning.timeout) {
+        enabled = true;
+    }
     if (!enabled) {
         return false;
     }
@@ -404,14 +335,14 @@ void Plopter::update_auto_armed()
 
     }else{
         // arm checks
-        
+
         // for tradheli if motors are armed and throttle is above zero and the motor is started, auto_armed should be true
         if(motors->armed() && ap.using_interlock) {
             if(!ap.throttle_zero && motors->get_spool_state() == AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
                 set_auto_armed(true);
             }
-        // if motors are armed and throttle is above zero auto_armed should be true
-        // if motors are armed and we are in throw mode, then auto_armed should be true
+            // if motors are armed and throttle is above zero auto_armed should be true
+            // if motors are armed and we are in throw mode, then auto_armed should be true
         } else if (motors->armed() && !ap.using_interlock) {
             if(!ap.throttle_zero || flightmode->mode_number() == Mode::Number::THROW) {
                 set_auto_armed(true);
@@ -438,164 +369,165 @@ bool Plopter::should_log(uint32_t mask)
  */
 void Plopter::allocate_motors(void)
 {
-//    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
-//#if FRAME_CONFIG != HELI_FRAME
-//        case AP_Motors::MOTOR_FRAME_QUAD:
-//        case AP_Motors::MOTOR_FRAME_HEXA:
-//        case AP_Motors::MOTOR_FRAME_Y6:
-//        case AP_Motors::MOTOR_FRAME_OCTA:
-//        case AP_Motors::MOTOR_FRAME_OCTAQUAD:
-//        case AP_Motors::MOTOR_FRAME_DODECAHEXA:
-//        case AP_Motors::MOTOR_FRAME_DECA:
-//        case AP_Motors::MOTOR_FRAME_SCRIPTING_MATRIX:
-//        default:
-//            motors = new AP_MotorsMatrix(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsMatrix::var_info;
-//            break;
-//        case AP_Motors::MOTOR_FRAME_TRI:
-//            motors = new AP_MotorsTri(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsTri::var_info;
-//            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_TRICOPTER);
-//            break;
-//        case AP_Motors::MOTOR_FRAME_SINGLE:
-//            motors = new AP_MotorsSingle(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsSingle::var_info;
-//            break;
-//        case AP_Motors::MOTOR_FRAME_COAX:
-//            motors = new AP_MotorsCoax(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsCoax::var_info;
-//            break;
-//        case AP_Motors::MOTOR_FRAME_TAILSITTER:
-//            motors = new AP_MotorsTailsitter(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsTailsitter::var_info;
-//            break;
-//        case AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING:
-//#if AP_SCRIPTING_ENABLED
-//            motors = new AP_MotorsMatrix_6DoF_Scripting(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsMatrix_6DoF_Scripting::var_info;
-//#endif // AP_SCRIPTING_ENABLED
-//            break;
-//case AP_Motors::MOTOR_FRAME_DYNAMIC_SCRIPTING_MATRIX:
-//#if AP_SCRIPTING_ENABLED
-//            motors = new AP_MotorsMatrix_Scripting_Dynamic(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsMatrix_Scripting_Dynamic::var_info;
-//#endif // AP_SCRIPTING_ENABLED
-//            break;
-//#else // FRAME_CONFIG == HELI_FRAME
-//        case AP_Motors::MOTOR_FRAME_HELI_DUAL:
-//            motors = new AP_MotorsHeli_Dual(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsHeli_Dual::var_info;
-//            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
-//            break;
-//
-//        case AP_Motors::MOTOR_FRAME_HELI_QUAD:
-//            motors = new AP_MotorsHeli_Quad(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsHeli_Quad::var_info;
-//            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
-//            break;
-//
-//        case AP_Motors::MOTOR_FRAME_HELI:
-//        default:
-//            motors = new AP_MotorsHeli_Single(plopter.scheduler.get_loop_rate_hz());
-//            motors_var_info = AP_MotorsHeli_Single::var_info;
-//            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
-//            break;
-//#endif
-//    }
-//    if (motors == nullptr) {
-//        AP_BoardConfig::allocation_error("FRAME_CLASS=%u", (unsigned)g2.frame_class.get());
-//    }
-//    AP_Param::load_object_from_eeprom(motors, motors_var_info);
-//
-//    ahrs_view = ahrs.create_view(ROTATION_NONE);
-//    if (ahrs_view == nullptr) {
-//        AP_BoardConfig::allocation_error("AP_AHRS_View");
-//    }
-//
-//    const struct AP_Param::GroupInfo *ac_var_info;
-//
-//#if FRAME_CONFIG != HELI_FRAME
-//    if ((AP_Motors::motor_frame_class)g2.frame_class.get() == AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING) {
-//#if AP_SCRIPTING_ENABLED
-//        attitude_control = new AC_AttitudeControl_Multi_6DoF(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
-//        ac_var_info = AC_AttitudeControl_Multi_6DoF::var_info;
-//#endif // AP_SCRIPTING_ENABLED
-//    } else {
-//        attitude_control = new AC_AttitudeControl_Multi(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
-//        ac_var_info = AC_AttitudeControl_Multi::var_info;
-//    }
-//#else
-//    attitude_control = new AC_AttitudeControl_Heli(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
-//    ac_var_info = AC_AttitudeControl_Heli::var_info;
-//#endif
-//    if (attitude_control == nullptr) {
-//        AP_BoardConfig::allocation_error("AttitudeControl");
-//    }
-//    AP_Param::load_object_from_eeprom(attitude_control, ac_var_info);
-//
-//    pos_control = new AC_PosControl(*ahrs_view, inertial_nav, *motors, *attitude_control, scheduler.get_loop_period_s());
-//    if (pos_control == nullptr) {
-//        AP_BoardConfig::allocation_error("PosControl");
-//    }
-//    AP_Param::load_object_from_eeprom(pos_control, pos_control->var_info);
-//
-//#if AC_OAPATHPLANNER_ENABLED == ENABLED
-//    wp_nav = new AC_WPNav_OA(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
-//#else
-//    wp_nav = new AC_WPNav(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
-//#endif
-//    if (wp_nav == nullptr) {
-//        AP_BoardConfig::allocation_error("WPNav");
-//    }
-//    AP_Param::load_object_from_eeprom(wp_nav, wp_nav->var_info);
-//
-//    loiter_nav = new AC_Loiter(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
-//    if (loiter_nav == nullptr) {
-//        AP_BoardConfig::allocation_error("LoiterNav");
-//    }
-//    AP_Param::load_object_from_eeprom(loiter_nav, loiter_nav->var_info);
-//
-//#if MODE_CIRCLE_ENABLED == ENABLED
-//    circle_nav = new AC_Circle(inertial_nav, *ahrs_view, *pos_control);
-//    if (circle_nav == nullptr) {
-//        AP_BoardConfig::allocation_error("CircleNav");
-//    }
-//    AP_Param::load_object_from_eeprom(circle_nav, circle_nav->var_info);
-//#endif
-//
-//    // reload lines from the defaults file that may now be accessible
-//    AP_Param::reload_defaults_file(true);
-//
-//    // now setup some frame-class specific defaults
-//    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
-//    case AP_Motors::MOTOR_FRAME_Y6:
-//        attitude_control->get_rate_roll_pid().kP().set_default(0.1);
-//        attitude_control->get_rate_roll_pid().kD().set_default(0.006);
-//        attitude_control->get_rate_pitch_pid().kP().set_default(0.1);
-//        attitude_control->get_rate_pitch_pid().kD().set_default(0.006);
-//        attitude_control->get_rate_yaw_pid().kP().set_default(0.15);
-//        attitude_control->get_rate_yaw_pid().kI().set_default(0.015);
-//        break;
-//    case AP_Motors::MOTOR_FRAME_TRI:
-//        attitude_control->get_rate_yaw_pid().filt_D_hz().set_default(100);
-//        break;
-//    default:
-//        break;
-//    }
-//
-//    // brushed 16kHz defaults to 16kHz pulses
-//    if (motors->is_brushed_pwm_type()) {
-//        g.rc_speed.set_default(16000);
-//    }
-//
-//    // upgrade parameters. This must be done after allocating the objects
-//    convert_pid_parameters();
-//#if FRAME_CONFIG == HELI_FRAME
-//    convert_tradheli_parameters();
-//#endif
-//
-//    // param count could have changed
-//    AP_Param::invalidate_count();
+    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
+#if FRAME_CONFIG != HELI_FRAME
+        case AP_Motors::MOTOR_FRAME_QUAD:
+        case AP_Motors::MOTOR_FRAME_HEXA:
+        case AP_Motors::MOTOR_FRAME_Y6:
+        case AP_Motors::MOTOR_FRAME_OCTA:
+        case AP_Motors::MOTOR_FRAME_OCTAQUAD:
+        case AP_Motors::MOTOR_FRAME_DODECAHEXA:
+        case AP_Motors::MOTOR_FRAME_DECA:
+        case AP_Motors::MOTOR_FRAME_SCRIPTING_MATRIX:
+        default:
+            motors = new AP_MotorsMatrix(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsMatrix::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_TRI:
+            motors = new AP_MotorsTri(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsTri::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_TRICOPTER);
+            break;
+        case AP_Motors::MOTOR_FRAME_SINGLE:
+            motors = new AP_MotorsSingle(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsSingle::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_COAX:
+            motors = new AP_MotorsCoax(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsCoax::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_TAILSITTER:
+            motors = new AP_MotorsTailsitter(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsTailsitter::var_info;
+            break;
+        case AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING:
+#if AP_SCRIPTING_ENABLED
+            motors = new AP_MotorsMatrix_6DoF_Scripting(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsMatrix_6DoF_Scripting::var_info;
+#endif // AP_SCRIPTING_ENABLED
+            break;
+        case AP_Motors::MOTOR_FRAME_DYNAMIC_SCRIPTING_MATRIX:
+#if AP_SCRIPTING_ENABLED
+            motors = new AP_MotorsMatrix_Scripting_Dynamic(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsMatrix_Scripting_Dynamic::var_info;
+#endif // AP_SCRIPTING_ENABLED
+            break;
+#else // FRAME_CONFIG == HELI_FRAME
+        case AP_Motors::MOTOR_FRAME_HELI_DUAL:
+            motors = new AP_MotorsHeli_Dual(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsHeli_Dual::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
+            break;
+
+        case AP_Motors::MOTOR_FRAME_HELI_QUAD:
+            motors = new AP_MotorsHeli_Quad(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsHeli_Quad::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
+            break;
+
+        case AP_Motors::MOTOR_FRAME_HELI:
+        default:
+            motors = new AP_MotorsHeli_Single(plopter.scheduler.get_loop_rate_hz());
+            motors_var_info = AP_MotorsHeli_Single::var_info;
+            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
+            break;
+#endif
+    }
+    if (motors == nullptr) {
+        AP_BoardConfig::allocation_error("FRAME_CLASS=%u", (unsigned)g2.frame_class.get());
+    }
+    AP_Param::load_object_from_eeprom(motors, motors_var_info);
+
+    ahrs_view = ahrs.create_view(ROTATION_NONE);
+    if (ahrs_view == nullptr) {
+        AP_BoardConfig::allocation_error("AP_AHRS_View");
+    }
+
+    const struct AP_Param::GroupInfo *ac_var_info;
+
+#if FRAME_CONFIG != HELI_FRAME
+    if ((AP_Motors::motor_frame_class)g2.frame_class.get() == AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING) {
+#if AP_SCRIPTING_ENABLED
+        //attitude_control = new AC_AttitudeControl_Multi_6DoF(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
+        //ac_var_info = AC_AttitudeControl_Multi_6DoF::var_info;
+        //I know I messed this up HRS
+#endif // AP_SCRIPTING_ENABLED
+    } else {
+        attitude_control = new AC_AttitudeControl_Multi(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
+        ac_var_info = AC_AttitudeControl_Multi::var_info;
+    }
+#else
+    attitude_control = new AC_AttitudeControl_Heli(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
+    ac_var_info = AC_AttitudeControl_Heli::var_info;
+#endif
+    if (attitude_control == nullptr) {
+        AP_BoardConfig::allocation_error("AttitudeControl");
+    }
+    AP_Param::load_object_from_eeprom(attitude_control, ac_var_info);
+
+    pos_control = new AC_PosControl(*ahrs_view, inertial_nav, *motors, *attitude_control, scheduler.get_loop_period_s());
+    if (pos_control == nullptr) {
+        AP_BoardConfig::allocation_error("PosControl");
+    }
+    AP_Param::load_object_from_eeprom(pos_control, pos_control->var_info);
+
+#if AC_OAPATHPLANNER_ENABLED == ENABLED
+    wp_nav = new AC_WPNav_OA(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
+#else
+    wp_nav = new AC_WPNav(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
+#endif
+    if (wp_nav == nullptr) {
+        AP_BoardConfig::allocation_error("WPNav");
+    }
+    AP_Param::load_object_from_eeprom(wp_nav, wp_nav->var_info);
+
+    loiter_nav = new AC_Loiter(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
+    if (loiter_nav == nullptr) {
+        AP_BoardConfig::allocation_error("LoiterNav");
+    }
+    AP_Param::load_object_from_eeprom(loiter_nav, loiter_nav->var_info);
+
+#if MODE_CIRCLE_ENABLED == ENABLED
+    circle_nav = new AC_Circle(inertial_nav, *ahrs_view, *pos_control);
+    if (circle_nav == nullptr) {
+        AP_BoardConfig::allocation_error("CircleNav");
+    }
+    AP_Param::load_object_from_eeprom(circle_nav, circle_nav->var_info);
+#endif
+
+    // reload lines from the defaults file that may now be accessible
+    AP_Param::reload_defaults_file(true);
+
+    // now setup some frame-class specific defaults
+    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
+        case AP_Motors::MOTOR_FRAME_Y6:
+            attitude_control->get_rate_roll_pid().kP().set_default(0.1);
+            attitude_control->get_rate_roll_pid().kD().set_default(0.006);
+            attitude_control->get_rate_pitch_pid().kP().set_default(0.1);
+            attitude_control->get_rate_pitch_pid().kD().set_default(0.006);
+            attitude_control->get_rate_yaw_pid().kP().set_default(0.15);
+            attitude_control->get_rate_yaw_pid().kI().set_default(0.015);
+            break;
+        case AP_Motors::MOTOR_FRAME_TRI:
+            attitude_control->get_rate_yaw_pid().filt_D_hz().set_default(100);
+            break;
+        default:
+            break;
+    }
+
+    // brushed 16kHz defaults to 16kHz pulses
+    if (motors->is_brushed_pwm_type()) {
+        g.rc_speed.set_default(16000);
+    }
+
+    // upgrade parameters. This must be done after allocating the objects
+    convert_pid_parameters();
+#if FRAME_CONFIG == HELI_FRAME
+    convert_tradheli_parameters();
+#endif
+
+    // param count could have changed
+    AP_Param::invalidate_count();
 }
 
 bool Plopter::is_tradheli() const
