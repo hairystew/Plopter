@@ -392,6 +392,16 @@ class VehicleInfo(object):
             },
         },
     },
+    "ArduPlopter": {
+                "default_frame": "plopter",
+                "frames": {
+                    "plopter": {
+                        "model": "plop",
+                        "waf_target": "bin/plopter",
+                        "default_params_filename": "default_params/plopter.parm",
+                    },
+                },
+            },
 }
 
 

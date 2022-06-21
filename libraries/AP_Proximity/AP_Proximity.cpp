@@ -535,7 +535,8 @@ void AP_Proximity::log()
 
     Proximity_Distance_Array dist_array{}; // raw distances stored here
     Proximity_Distance_Array filt_dist_array{}; //filtered distances stored here
-    auto &logger { AP::logger() };
+    auto &logger = AP::logger();
+    //auto &logger { AP::logger() }; HRS
     for (uint8_t i = 0; i < get_num_layers(); i++) {
         const bool active = get_active_layer_distances(i, dist_array, filt_dist_array);
         if (!active) {

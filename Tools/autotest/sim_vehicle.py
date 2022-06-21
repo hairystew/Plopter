@@ -272,7 +272,8 @@ def kill_tasks():
             'scrimmage',
             'ardurover',
             'arduplane',
-            'arducopter'
+            'arducopter',
+            'plopter'
         }
         for vehicle in vinfo.options:
             for frame in vinfo.options[vehicle]["frames"]:
@@ -904,6 +905,7 @@ vehicle_choices.append("copter")  # should change to ArduCopter at some stage
 vehicle_choices.append("plane")  # should change to ArduPlane at some stage
 vehicle_choices.append("sub")  # should change to Sub at some stage
 vehicle_choices.append("blimp")  # should change to Blimp at some stage
+vehicle_choices.append("Plopter")  # should change to Blimp at some stage
 
 parser.add_option("-v", "--vehicle",
                   type='choice',
@@ -1308,6 +1310,7 @@ vehicle_map = {
     "plane": "ArduPlane",  # will switch eventually
     "sub": "ArduSub",  # will switch eventually
     "blimp" : "Blimp", # will switch eventually
+    "Plopter" : "Plopter", # will switch eventually
 }
 if cmd_opts.vehicle in vehicle_map:
     progress("%s is now known as %s" %
