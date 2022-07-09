@@ -1,123 +1,225 @@
+/*
+  additional arming checks for plopter
+ */
+#include "AP_Arming.h"
 #include "Plopter.h"
 
-#if HAL_MAX_CAN_PROTOCOL_DRIVERS
- #include <AP_ToshibaCAN/AP_ToshibaCAN.h>
-#endif
+#include "qautotune.h"
 
-// performs pre-arm checks. expects to be called at 1hz.
-void AP_Arming_Plopter::update(void)
-{
-    // perform pre-arm checks & display failures every 30 seconds
-    static uint8_t pre_arm_display_counter = PREARM_DISPLAY_PERIOD/2;
-    pre_arm_display_counter++;
-    bool display_fail = false;
-    if (pre_arm_display_counter >= PREARM_DISPLAY_PERIOD) {
-        display_fail = true;
-        pre_arm_display_counter = 0;
-    }
+constexpr uint32_t AP_ARMING_DELAY_MS = 2000; // delay from arming to start of motor spoolup
 
-    pre_arm_checks(display_fail);
-}
+const AP_Param::GroupInfo AP_Arming_Plopter::var_info[] = {
+    // variables from parent vehicle
+    AP_NESTEDGROUPINFO(AP_Arming, 0),
 
+    // index 3 was RUDDER and should not be used
+
+    AP_GROUPEND
+};
+
+/*
+  additional arming checks for plopter
+
+ */
 bool AP_Arming_Plopter::pre_arm_checks(bool display_failure)
 {
-    const bool passed = run_pre_arm_checks(display_failure);
-    set_pre_arm_check(passed);
-    return passed;
-}
-
-// perform pre-arm checks
-//  return true if the checks pass successfully
-bool AP_Arming_Plopter::run_pre_arm_checks(bool display_failure)
-{
-    // exit immediately if already armed
-    if (plopter.motors->armed()) {
+    if (armed || require == (uint8_t)Required::NO) {
+        // if we are already armed or don't need any arming checks
+        // then skip the checks
+        return true;
+    }
+    //are arming checks disabled?
+    if (checks_to_perform == 0) {
+        return true;
+    }
+    if (hal.util->was_watchdog_armed()) {
+        // on watchdog reset bypass arming checks to allow for
+        // in-flight arming if we were armed before the reset. This
+        // allows a reset on a BVLOS flight to return home if the
+        // operator can command arming over telemetry
         return true;
     }
 
-    // check if motor interlock and Emergency Stop aux switches are used
-    // at the same time.  This cannot be allowed.
-    if (rc().find_channel_for_option(RC_Channel::AUX_FUNC::MOTOR_INTERLOCK) &&
-        rc().find_channel_for_option(RC_Channel::AUX_FUNC::MOTOR_ESTOP)){
-        check_failed(display_failure, "Interlock/E-Stop Conflict");
-        return false;
+    // call parent class checks
+    bool ret = AP_Arming::pre_arm_checks(display_failure);
+
+    // Check airspeed sensor
+    ret &= AP_Arming::airspeed_checks(display_failure);
+
+    if (plopter.g.fs_timeout_long < plopter.g.fs_timeout_short && plopter.g.fs_action_short != FS_ACTION_SHORT_DISABLED) {
+        check_failed(display_failure, "FS_LONG_TIMEOUT < FS_SHORT_TIMEOUT");
+        ret = false;
     }
 
-    // check if motor interlock aux switch is in use
-    // if it is, switch needs to be in disabled position to arm
-    // otherwise exit immediately.  This check to be repeated,
-    // as state can change at any time.
-    if (plopter.ap.using_interlock && plopter.ap.motor_interlock_switch) {
-        check_failed(display_failure, "Motor Interlock Enabled");
+    if (plopter.aparm.roll_limit_cd < 300) {
+        check_failed(display_failure, "LIM_ROLL_CD too small (%u)", (unsigned)plopter.aparm.roll_limit_cd);
+        ret = false;
     }
 
-    // if pre arm checks are disabled run only the mandatory checks
-    if (checks_to_perform == 0) {
-        return mandatory_checks(display_failure);
+    if (plopter.aparm.pitch_limit_max_cd < 300) {
+        check_failed(display_failure, "LIM_PITCH_MAX too small (%u)", (unsigned)plopter.aparm.pitch_limit_max_cd);
+        ret = false;
     }
 
-    return parameter_checks(display_failure)
-        & motor_checks(display_failure)
-        & oa_checks(display_failure)
-        & gcs_failsafe_check(display_failure)
-        & winch_checks(display_failure)
-        & alt_checks(display_failure)
-#if AP_AIRSPEED_ENABLED
-        & AP_Arming::airspeed_checks(display_failure)
+    if (plopter.aparm.pitch_limit_min_cd > -300) {
+        check_failed(display_failure, "LIM_PITCH_MIN too large (%u)", (unsigned)plopter.aparm.pitch_limit_min_cd);
+        ret = false;
+    }
+
+    if (plopter.channel_throttle->get_reverse() &&
+        Plopter::ThrFailsafe(plopter.g.throttle_fs_enabled.get()) != Plopter::ThrFailsafe::Disabled &&
+        plopter.g.throttle_fs_value <
+        plopter.channel_throttle->get_radio_max()) {
+        check_failed(display_failure, "Invalid THR_FS_VALUE for rev throttle");
+        ret = false;
+    }
+
+#if HAL_QUADPLANE_ENABLED
+    ret &= quadplopter_checks(display_failure);
 #endif
-        & AP_Arming::pre_arm_checks(display_failure);
+
+    if (plopter.control_mode == &plopter.mode_auto && plopter.mission.num_commands() <= 1) {
+        check_failed(display_failure, "No mission loaded");
+        ret = false;
+    }
+
+    // check adsb avoidance failsafe
+    if (plopter.failsafe.adsb) {
+        check_failed(display_failure, "ADSB threat detected");
+        ret = false;
+    }
+
+    if (SRV_Channels::get_emergency_stop()) {
+        check_failed(display_failure,"Motors Emergency Stopped");
+        ret = false;
+    }
+
+    if (plopter.g2.flight_options & FlightOptions::CENTER_THROTTLE_TRIM){
+       int16_t trim = plopter.channel_throttle->get_radio_trim();
+       if (trim < 1250 || trim > 1750) {
+           check_failed(display_failure, "Throttle trim not near center stick(%u)",trim );
+           ret = false;
+       }
+    }
+
+    if (plopter.mission.get_in_landing_sequence_flag()) {
+        check_failed(display_failure,"In landing sequence");
+        ret = false;
+    }
+    
+    return ret;
 }
 
-bool AP_Arming_Plopter::barometer_checks(bool display_failure)
+#if HAL_QUADPLANE_ENABLED
+bool AP_Arming_Plopter::quadplopter_checks(bool display_failure)
 {
-    if (!AP_Arming::barometer_checks(display_failure)) {
+    if (!plopter.quadplopter.enabled()) {
+        return true;
+    }
+
+    if (!plopter.quadplopter.available()) {
+        check_failed(display_failure, "Quadplopter enabled but not running");
         return false;
     }
 
     bool ret = true;
-    // check Baro
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_BARO)) {
-        // Check baro & inav alt are within 1m if EKF is operating in an absolute position mode.
-        // Do not check if intending to operate in a ground relative height mode as EKF will output a ground relative height
-        // that may differ from the baro height due to baro drift.
-        nav_filter_status filt_status = plopter.inertial_nav.get_filter_status();
-        bool using_baro_ref = (!filt_status.flags.pred_horiz_pos_rel && filt_status.flags.pred_horiz_pos_abs);
-        if (using_baro_ref) {
-            if (fabsf(plopter.inertial_nav.get_position_z_up_cm() - plopter.baro_alt) > PREARM_MAX_ALT_DISPARITY_CM) {
-                check_failed(ARMING_CHECK_BARO, display_failure, "Altitude disparity");
-                ret = false;
-            }
-        }
+
+    if (plopter.scheduler.get_loop_rate_hz() < 100) {
+        check_failed(display_failure, "quadplopter needs SCHED_LOOP_RATE >= 100");
+        ret = false;
     }
-    return ret;
-}
 
-bool AP_Arming_Plopter::ins_checks(bool display_failure)
-{
-    bool ret = AP_Arming::ins_checks(display_failure);
+    if (!plopter.quadplopter.motors->initialised_ok()) {
+        check_failed(display_failure, "Quadplopter: check motor setup");
+        ret = false;
+    }
 
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_INS)) {
+    // lean angle parameter check
+    if (plopter.quadplopter.aparm.angle_max < 1000 || plopter.quadplopter.aparm.angle_max > 8000) {
+        check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check Q_ANGLE_MAX");
+        ret = false;
+    }
 
-        // get ekf attitude (if bad, it's usually the gyro biases)
-        if (!pre_arm_ekf_attitude_check()) {
-            check_failed(ARMING_CHECK_INS, display_failure, "EKF attitude is bad");
+    if ((plopter.quadplopter.tailsitter.enable > 0) && (plopter.quadplopter.tiltrotor.enable > 0)) {
+        check_failed(ARMING_CHECK_PARAMETERS, display_failure, "set TAILSIT_ENABLE 0 or TILT_ENABLE 0");
+        ret = false;
+
+    } else {
+
+        if ((plopter.quadplopter.tailsitter.enable > 0) && !plopter.quadplopter.tailsitter.enabled()) {
+            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "tailsitter setup not complete, reboot");
+            ret = false;
+        }
+
+        if ((plopter.quadplopter.tiltrotor.enable > 0) && !plopter.quadplopter.tiltrotor.enabled()) {
+            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "tiltrotor setup not complete, reboot");
             ret = false;
         }
     }
 
+    // ensure controllers are OK with us arming:
+    char failure_msg[50];
+    if (!plopter.quadplopter.pos_control->pre_arm_checks("PSC", failure_msg, ARRAY_SIZE(failure_msg))) {
+        check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Bad parameter: %s", failure_msg);
+        ret = false;
+    }
+    if (!plopter.quadplopter.attitude_control->pre_arm_checks("ATC", failure_msg, ARRAY_SIZE(failure_msg))) {
+        check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Bad parameter: %s", failure_msg);
+        ret = false;
+    }
+    if (!plopter.quadplopter.motors->check_mot_pwm_params()) {
+        check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check Q_M_PWM_MIN/MAX");
+        ret = false;
+    }
+
+    if ((plopter.quadplopter.options & QuadPlopter::OPTION_ONLY_ARM_IN_QMODE_OR_AUTO) != 0) {
+        if (!plopter.control_mode->is_vtol_mode() && (plopter.control_mode != &plopter.mode_auto) && (plopter.control_mode != &plopter.mode_guided)) {
+            check_failed(display_failure,"not in Q mode");
+            ret = false;
+        }
+        if ((plopter.control_mode == &plopter.mode_auto) && !plopter.quadplopter.is_vtol_takeoff(plopter.mission.get_current_nav_cmd().id)) {
+            check_failed(display_failure,"not in VTOL takeoff");
+            ret = false;
+        }
+    }
+
+    if ((plopter.control_mode == &plopter.mode_auto) && !plopter.mission.starts_with_takeoff_cmd()) {
+        check_failed(display_failure,"missing takeoff waypoint");
+        ret = false;
+    }
+
+    if (plopter.control_mode == &plopter.mode_rtl) {
+        check_failed(display_failure,"in RTL mode");
+        ret = false;
+    }
+    
+    /*
+      Q_ASSIST_SPEED really should be enabled for all quadplopters except tailsitters
+     */
+    if (check_enabled(ARMING_CHECK_PARAMETERS) &&
+        is_zero(plopter.quadplopter.assist_speed) &&
+        !plopter.quadplopter.tailsitter.enabled()) {
+        check_failed(display_failure,"Q_ASSIST_SPEED is not set");
+        ret = false;
+    }
+
     return ret;
 }
+#endif // HAL_QUADPLANE_ENABLED
 
-bool AP_Arming_Plopter::board_voltage_checks(bool display_failure)
+bool AP_Arming_Plopter::ins_checks(bool display_failure)
 {
-    if (!AP_Arming::board_voltage_checks(display_failure)) {
+    // call parent class checks
+    if (!AP_Arming::ins_checks(display_failure)) {
         return false;
     }
 
-    // check battery voltage
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_VOLTAGE)) {
-        if (plopter.battery.has_failsafed()) {
-            check_failed(ARMING_CHECK_VOLTAGE, display_failure, "Battery failsafe");
+    // additional plopter specific checks
+    if ((checks_to_perform & ARMING_CHECK_ALL) ||
+        (checks_to_perform & ARMING_CHECK_INS)) {
+        char failure_msg[50] = {};
+        if (!AP::ahrs().pre_arm_check(true, failure_msg, sizeof(failure_msg))) {
+            check_failed(ARMING_CHECK_INS, display_failure, "AHRS: %s", failure_msg);
             return false;
         }
     }
@@ -125,788 +227,169 @@ bool AP_Arming_Plopter::board_voltage_checks(bool display_failure)
     return true;
 }
 
-bool AP_Arming_Plopter::parameter_checks(bool display_failure)
-{
-    // check various parameter values
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_PARAMETERS)) {
-
-        // failsafe parameter checks
-        if (plopter.g.failsafe_throttle) {
-            // check throttle min is above throttle failsafe trigger and that the trigger is above ppm encoder's loss-of-signal value of 900
-            if (plopter.channel_throttle->get_radio_min() <= plopter.g.failsafe_throttle_value+10 || plopter.g.failsafe_throttle_value < 910) {
-                check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check FS_THR_VALUE");
-                return false;
-            }
-        }
-        if (plopter.g.failsafe_gcs == FS_GCS_ENABLED_CONTINUE_MISSION) {
-            // FS_GCS_ENABLE == 2 has been removed
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "FS_GCS_ENABLE=2 removed, see FS_OPTIONS");
-        }
-
-        // lean angle parameter check
-        if (plopter.aparm.angle_max < 1000 || plopter.aparm.angle_max > 8000) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check ANGLE_MAX");
-            return false;
-        }
-
-        // acro balance parameter check
-#if MODE_ACRO_ENABLED == ENABLED || MODE_SPORT_ENABLED == ENABLED
-        if ((plopter.g.acro_balance_roll > plopter.attitude_control->get_angle_roll_p().kP()) || (plopter.g.acro_balance_pitch > plopter.attitude_control->get_angle_pitch_p().kP())) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check ACRO_BAL_ROLL/PITCH");
-            return false;
-        }
-#endif
-
-        // pilot-speed-up parameter check
-        if (plopter.g.pilot_speed_up <= 0) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check PILOT_SPEED_UP");
-            return false;
-        }
-
-        #if FRAME_CONFIG == HELI_FRAME
-        if (plopter.g2.frame_class.get() != AP_Motors::MOTOR_FRAME_HELI_QUAD &&
-            plopter.g2.frame_class.get() != AP_Motors::MOTOR_FRAME_HELI_DUAL &&
-            plopter.g2.frame_class.get() != AP_Motors::MOTOR_FRAME_HELI) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Invalid Heli FRAME_CLASS");
-            return false;
-        }
-
-        // check heliplopter parameters
-        if (!plopter.motors->parameter_check(display_failure)) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Heli motors checks failed");
-            return false;
-        }
-
-        char fail_msg[50];
-        // check input mangager parameters
-        if (!plopter.input_manager.parameter_check(fail_msg, ARRAY_SIZE(fail_msg))) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "%s", fail_msg);
-            return false;
-        }
-
-        // Inverted flight feature disabled for Heli Single and Dual frames
-        if (plopter.g2.frame_class.get() != AP_Motors::MOTOR_FRAME_HELI_QUAD &&
-            rc().find_channel_for_option(RC_Channel::aux_func_t::INVERTED) != nullptr) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Inverted flight option not supported");
-            return false;
-        }
-        // Ensure an Aux Channel is configured for motor interlock
-        if (rc().find_channel_for_option(RC_Channel::aux_func_t::MOTOR_INTERLOCK) == nullptr) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Motor Interlock not configured");
-            return false;
-        }
-
-        #else
-        if (plopter.g2.frame_class.get() == AP_Motors::MOTOR_FRAME_HELI_QUAD ||
-            plopter.g2.frame_class.get() == AP_Motors::MOTOR_FRAME_HELI_DUAL ||
-            plopter.g2.frame_class.get() == AP_Motors::MOTOR_FRAME_HELI) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Invalid MultiPlopter FRAME_CLASS");
-            return false;
-        }
-
-        // checks MOT_PWM_MIN/MAX for acceptable values
-        if (!plopter.motors->check_mot_pwm_params()) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Check MOT_PWM_MIN/MAX");
-            return false;
-        }
-        #endif // HELI_FRAME
-
-        // checks when using range finder for RTL
-#if MODE_RTL_ENABLED == ENABLED
-        if (plopter.mode_rtl.get_alt_type() == ModeRTL::RTLAltType::RTL_ALTTYPE_TERRAIN) {
-            // get terrain source from wpnav
-            const char *failure_template = "RTL_ALT_TYPE is above-terrain but %s";
-            switch (plopter.wp_nav->get_terrain_source()) {
-            case AC_WPNav::TerrainSource::TERRAIN_UNAVAILABLE:
-                check_failed(ARMING_CHECK_PARAMETERS, display_failure, failure_template, "no terrain data");
-                return false;
-                break;
-            case AC_WPNav::TerrainSource::TERRAIN_FROM_RANGEFINDER:
-                if (!plopter.rangefinder_state.enabled || !plopter.rangefinder.has_orientation(ROTATION_PITCH_270)) {
-                    check_failed(ARMING_CHECK_PARAMETERS, display_failure, failure_template, "no rangefinder");
-                    return false;
-                }
-                // check if RTL_ALT is higher than rangefinder's max range
-                if (plopter.g.rtl_altitude > plopter.rangefinder.max_distance_cm_orient(ROTATION_PITCH_270)) {
-                    check_failed(ARMING_CHECK_PARAMETERS, display_failure, failure_template, "RTL_ALT>RNGFND_MAX_CM");
-                    return false;
-                }
-                break;
-            case AC_WPNav::TerrainSource::TERRAIN_FROM_TERRAINDATABASE:
-#if AP_TERRAIN_AVAILABLE
-                if (!plopter.terrain.enabled()) {
-                    check_failed(ARMING_CHECK_PARAMETERS, display_failure, failure_template, "terrain disabled");
-                    return false;
-                }
-                // check terrain data is loaded
-                uint16_t terr_pending, terr_loaded;
-                plopter.terrain.get_statistics(terr_pending, terr_loaded);
-                if (terr_pending != 0) {
-                    check_failed(ARMING_CHECK_PARAMETERS, display_failure, failure_template, "waiting for terrain data");
-                    return false;
-                }
-#else
-                check_failed(ARMING_CHECK_PARAMETERS, display_failure, failure_template, "terrain disabled");
-                return false;
-#endif
-                break;
-            }
-        }
-#endif
-
-        // check adsb avoidance failsafe
-#if HAL_ADSB_ENABLED
-        if (plopter.failsafe.adsb) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "ADSB threat detected");
-            return false;
-        }
-#endif
-
-        // ensure controllers are OK with us arming:
-        char failure_msg[50];
-        if (!plopter.pos_control->pre_arm_checks("PSC", failure_msg, ARRAY_SIZE(failure_msg))) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Bad parameter: %s", failure_msg);
-            return false;
-        }
-        if (!plopter.attitude_control->pre_arm_checks("ATC", failure_msg, ARRAY_SIZE(failure_msg))) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Bad parameter: %s", failure_msg);
-            return false;
-        }
-    }
-
-    return true;
-}
-
-// check motor setup was successful
-bool AP_Arming_Plopter::motor_checks(bool display_failure)
-{
-    // check motors initialised  correctly
-    if (!plopter.motors->initialised_ok()) {
-        check_failed(display_failure, "Check firmware or FRAME_CLASS");
-        return false;
-    }
-
-	// servo_test check
-#if FRAME_CONFIG == HELI_FRAME
-    if (plopter.motors->servo_test_running()) {
-        check_failed(display_failure, "Servo Test is still running");
-        return false;
-    }
-#endif
-    // further checks enabled with parameters
-    if (!check_enabled(ARMING_CHECK_PARAMETERS)) {
-        return true;
-    }
-
-    // if this is a multiplopter using ToshibaCAN ESCs ensure MOT_PMW_MIN = 1000, MOT_PWM_MAX = 2000
-#if HAL_MAX_CAN_PROTOCOL_DRIVERS && (FRAME_CONFIG != HELI_FRAME)
-    bool tcan_active = false;
-    uint8_t tcan_index = 0;
-    const uint8_t num_drivers = AP::can().get_num_drivers();
-    for (uint8_t i = 0; i < num_drivers; i++) {
-        if (AP::can().get_driver_type(i) == AP_CANManager::Driver_Type_ToshibaCAN) {
-            tcan_active = true;
-            tcan_index = i;
-        }
-    }
-    if (tcan_active) {
-        // check motor range parameters
-        if (plopter.motors->get_pwm_output_min() != 1000) {
-            check_failed(display_failure, "TCAN ESCs require MOT_PWM_MIN=1000");
-            return false;
-        }
-        if (plopter.motors->get_pwm_output_max() != 2000) {
-            check_failed(display_failure, "TCAN ESCs require MOT_PWM_MAX=2000");
-            return false;
-        }
-
-        // check we have an ESC present for every SERVOx_FUNCTION = motorx
-        // find and report first missing ESC, extra ESCs are OK
-        AP_ToshibaCAN *tcan = AP_ToshibaCAN::get_tcan(tcan_index);
-        const uint16_t motors_mask = plopter.motors->get_motor_mask();
-        const uint16_t esc_mask = tcan->get_present_mask();
-        uint8_t escs_missing = 0;
-        uint8_t first_missing = 0;
-        for (uint8_t i = 0; i < 16; i++) {
-            uint32_t bit = 1UL << i;
-            if (((motors_mask & bit) > 0) && ((esc_mask & bit) == 0)) {
-                escs_missing++;
-                if (first_missing == 0) {
-                    first_missing = i+1;
-                }
-            }
-        }
-        if (escs_missing > 0) {
-            check_failed(display_failure, "TCAN missing %d escs, check #%d", (int)escs_missing, (int)first_missing);
-            return false;
-        }
-    }
-#endif
-
-    return true;
-}
-
-bool AP_Arming_Plopter::oa_checks(bool display_failure)
-{
-#if AC_OAPATHPLANNER_ENABLED == ENABLED
-    char failure_msg[50];
-    if (plopter.g2.oa.pre_arm_check(failure_msg, ARRAY_SIZE(failure_msg))) {
-        return true;
-    }
-    // display failure
-    if (strlen(failure_msg) == 0) {
-        check_failed(display_failure, "%s", "Check Object Avoidance");
-    } else {
-        check_failed(display_failure, "%s", failure_msg);
-    }
-    return false;
-#else
-    return true;
-#endif
-}
-
-bool AP_Arming_Plopter::rc_calibration_checks(bool display_failure)
-{
-//    const RC_Channel *channels[] = {
-//        plopter.channel_roll,
-//        plopter.channel_pitch,
-//        plopter.channel_throttle,
-//        plopter.channel_yaw
-//    };
-
-    //Come back to this
-
-//    plopter.ap.pre_arm_rc_check = rc_checks_copter_sub(display_failure, channels)(display_failure, channels)
-//        & AP_Arming::rc_calibration_checks(display_failure);
-//
-//    return plopter.ap.pre_arm_rc_check;
-	return true;
-}
-
-// performs pre_arm gps related checks and returns true if passed
-bool AP_Arming_Plopter::gps_checks(bool display_failure)
-{
-    // check if fence requires GPS
-    bool fence_requires_gps = false;
-    #if AC_FENCE == ENABLED
-    // if circular or polygon fence is enabled we need GPS
-    fence_requires_gps = (plopter.fence.get_enabled_fences() & (AC_FENCE_TYPE_CIRCLE | AC_FENCE_TYPE_POLYGON)) > 0;
-    #endif
-
-    // check if flight mode requires GPS
-    bool mode_requires_gps = plopter.flightmode->requires_GPS() || fence_requires_gps || (plopter.simple_mode == Plopter::SimpleMode::SUPERSIMPLE);
-
-    // call parent gps checks
-    if (mode_requires_gps) {
-        if (!AP_Arming::gps_checks(display_failure)) {
-            AP_Notify::flags.pre_arm_gps_check = false;
-            return false;
-        }
-    }
-
-    // run mandatory gps checks first
-    if (!mandatory_gps_checks(display_failure)) {
-        AP_Notify::flags.pre_arm_gps_check = false;
-        return false;
-    }
-
-    // return true if GPS is not required
-    if (!mode_requires_gps) {
-        AP_Notify::flags.pre_arm_gps_check = true;
-        return true;
-    }
-
-    // return true immediately if gps check is disabled
-    if (!(checks_to_perform == ARMING_CHECK_ALL || checks_to_perform & ARMING_CHECK_GPS)) {
-        AP_Notify::flags.pre_arm_gps_check = true;
-        return true;
-    }
-
-    // warn about hdop separately - to prevent user confusion with no gps lock
-    if (plopter.gps.get_hdop() > plopter.g.gps_hdop_good) {
-        check_failed(ARMING_CHECK_GPS, display_failure, "High GPS HDOP");
-        AP_Notify::flags.pre_arm_gps_check = false;
-        return false;
-    }
-
-    // if we got here all must be ok
-    AP_Notify::flags.pre_arm_gps_check = true;
-    return true;
-}
-
-// check ekf attitude is acceptable
-bool AP_Arming_Plopter::pre_arm_ekf_attitude_check()
-{
-    // get ekf filter status
-    nav_filter_status filt_status = plopter.inertial_nav.get_filter_status();
-
-    return filt_status.flags.attitude;
-}
-
-// check nothing is too close to vehicle
-bool AP_Arming_Plopter::proximity_checks(bool display_failure) const
-{
-#if HAL_PROXIMITY_ENABLED
-
-    if (!AP_Arming::proximity_checks(display_failure)) {
-        return false;
-    }
-
-    if (!((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_PARAMETERS))) {
-        // check is disabled
-        return true;
-    }
-
-    // get closest object if we might use it for avoidance
-#if AC_AVOID_ENABLED == ENABLED
-    float angle_deg, distance;
-    if (plopter.avoid.proximity_avoidance_enabled() && plopter.g2.proximity.get_closest_object(angle_deg, distance)) {
-        // display error if something is within 60cm
-        const float tolerance = 0.6f;
-        if (distance <= tolerance) {
-            check_failed(ARMING_CHECK_PARAMETERS, display_failure, "Proximity %d deg, %4.2fm (want > %0.1fm)", (int)angle_deg, (double)distance, (double)tolerance);
-            return false;
-        }
-    }
-#endif
-
-#endif
-    return true;
-}
-
-// performs mandatory gps checks.  returns true if passed
-bool AP_Arming_Plopter::mandatory_gps_checks(bool display_failure)
-{
-    // check if flight mode requires GPS
-    bool mode_requires_gps = plopter.flightmode->requires_GPS();
-
-    // always check if inertial nav has started and is ready
-    const auto &ahrs = AP::ahrs();
-    char failure_msg[50] = {};
-    if (!ahrs.pre_arm_check(mode_requires_gps, failure_msg, sizeof(failure_msg))) {
-        check_failed(display_failure, "AHRS: %s", failure_msg);
-        return false;
-    }
-
-    // check if fence requires GPS
-    bool fence_requires_gps = false;
-    #if AC_FENCE == ENABLED
-    // if circular or polygon fence is enabled we need GPS
-    fence_requires_gps = (plopter.fence.get_enabled_fences() & (AC_FENCE_TYPE_CIRCLE | AC_FENCE_TYPE_POLYGON)) > 0;
-    #endif
-
-    if (mode_requires_gps) {
-        if (!plopter.position_ok()) {
-            // vehicle level position estimate checks
-            check_failed(display_failure, "Need Position Estimate");
-            return false;
-        }
-    } else {
-        if (fence_requires_gps) {
-            if (!plopter.position_ok()) {
-                // clarify to user why they need GPS in non-GPS flight mode
-                check_failed(display_failure, "Fence enabled, need position estimate");
-                return false;
-            }
-        } else {
-            // return true if GPS is not required
-            return true;
-        }
-    }
-
-    // check for GPS glitch (as reported by EKF)
-    nav_filter_status filt_status;
-    if (ahrs.get_filter_status(filt_status)) {
-        if (filt_status.flags.gps_glitching) {
-            check_failed(display_failure, "GPS glitching");
-            return false;
-        }
-    }
-
-    // check EKF's compass, position and velocity variances are below failsafe threshold
-    if (plopter.g.fs_ekf_thresh > 0.0f) {
-        float vel_variance, pos_variance, hgt_variance, tas_variance;
-        Vector3f mag_variance;
-        ahrs.get_variances(vel_variance, pos_variance, hgt_variance, mag_variance, tas_variance);
-        if (mag_variance.length() >= plopter.g.fs_ekf_thresh) {
-            check_failed(display_failure, "EKF compass variance");
-            return false;
-        }
-        if (pos_variance >= plopter.g.fs_ekf_thresh) {
-            check_failed(display_failure, "EKF position variance");
-            return false;
-        }
-        if (vel_variance >= plopter.g.fs_ekf_thresh) {
-            check_failed(display_failure, "EKF velocity variance");
-            return false;
-        }
-    }
-
-    // check if home is too far from EKF origin
-    if (plopter.far_from_EKF_origin(ahrs.get_home())) {
-        check_failed(display_failure, "Home too far from EKF origin");
-        return false;
-    }
-
-    // check if vehicle is too far from EKF origin
-    if (plopter.far_from_EKF_origin(plopter.current_loc)) {
-        check_failed(display_failure, "Vehicle too far from EKF origin");
-        return false;
-    }
-
-    // if we got here all must be ok
-    return true;
-}
-
-// Check GCS failsafe
-bool AP_Arming_Plopter::gcs_failsafe_check(bool display_failure)
-{
-    if (plopter.failsafe.gcs) {
-        check_failed(display_failure, "GCS failsafe on");
-        return false;
-    }
-    return true;
-}
-
-// check winch
-bool AP_Arming_Plopter::winch_checks(bool display_failure) const
-{
-#if WINCH_ENABLED == ENABLED
-    // pass if parameter or all arming checks disabled
-    if (((checks_to_perform & ARMING_CHECK_ALL) == 0) && ((checks_to_perform & ARMING_CHECK_PARAMETERS) == 0)) {
-        return true;
-    }
-
-    const AP_Winch *winch = AP::winch();
-    if (winch == nullptr) {
-        return true;
-    }
-    char failure_msg[50] = {};
-    if (!winch->pre_arm_check(failure_msg, sizeof(failure_msg))) {
-        check_failed(display_failure, "%s", failure_msg);
-        return false;
-    }
-#endif
-    return true;
-}
-
-// performs altitude checks.  returns true if passed
-bool AP_Arming_Plopter::alt_checks(bool display_failure)
-{
-    // always EKF altitude estimate
-    if (!plopter.flightmode->has_manual_throttle() && !plopter.ekf_alt_ok()) {
-        check_failed(display_failure, "Need Alt Estimate");
-        return false;
-    }
-
-    return true;
-}
-
-// arm_checks - perform final checks before arming
-//  always called just before arming.  Return true if ok to arm
-//  has side-effect that logging is started
 bool AP_Arming_Plopter::arm_checks(AP_Arming::Method method)
 {
-    const auto &ahrs = AP::ahrs();
+    if (method == AP_Arming::Method::RUDDER) {
+        const AP_Arming::RudderArming arming_rudder = get_rudder_arming_type();
 
-    // always check if inertial nav has started and is ready
-    if (!ahrs.healthy()) {
-        check_failed(true, "AHRS not healthy");
-        return false;
-    }
+        if (arming_rudder == AP_Arming::RudderArming::IS_DISABLED) {
+            //parameter disallows rudder arming/disabling
 
-#ifndef ALLOW_ARM_NO_COMPASS
-    // if non-compass is source of heading we can skip compass health check
-    if (!ahrs.using_noncompass_for_yaw()) {
-        const Compass &_compass = AP::compass();
-        // check compass health
-        if (!_compass.healthy()) {
-            check_failed(true, "Compass not healthy");
+            // if we emit a message here then someone doing surface
+            // checks may be bothered by the message being emitted.
+            // check_failed(true, "Rudder arming disabled");
+            return false;
+        }
+
+        // if throttle is not down, then pilot cannot rudder arm/disarm
+        if (!is_zero(plopter.get_throttle_input())){
+            check_failed(true, "Non-zero throttle");
             return false;
         }
     }
-#endif
 
-    // always check if the current mode allows arming
-    if (!plopter.flightmode->allows_arming(method)) {
-        check_failed(true, "Mode not armable");
+    if (!plopter.control_mode->allows_arming()) {
+        check_failed(true, "Mode does not allow arming");
         return false;
     }
 
-    // always check motors
-    if (!motor_checks(true)) {
-        return false;
-    }
-
-    // if we are using motor interlock switch and it's enabled, fail to arm
-    // skip check in Throw mode which takes control of the motor interlock
-    if (plopter.ap.using_interlock && plopter.ap.motor_interlock_switch) {
-        check_failed(true, "Motor Interlock Enabled");
-        return false;
-    }
-
-    // if we are using motor Estop switch, it must not be in Estop position
-    if (SRV_Channels::get_emergency_stop()){
-        check_failed(true, "Motor Emergency Stopped");
-        return false;
-    }
-
-    // succeed if arming checks are disabled
+    //are arming checks disabled?
     if (checks_to_perform == 0) {
         return true;
     }
 
-    // check lean angle
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_INS)) {
-        if (degrees(acosf(ahrs.cos_roll()*ahrs.cos_pitch()))*100.0f > plopter.aparm.angle_max) {
-            check_failed(ARMING_CHECK_INS, true, "Leaning");
-            return false;
-        }
+    if (hal.util->was_watchdog_armed()) {
+        // on watchdog reset bypass arming checks to allow for
+        // in-flight arming if we were armed before the reset. This
+        // allows a reset on a BVLOS flight to return home if the
+        // operator can command arming over telemetry
+        gcs().send_text(MAV_SEVERITY_WARNING, "watchdog: Bypassing arming checks");
+        return true;
     }
 
-    // check adsb
-#if HAL_ADSB_ENABLED
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_PARAMETERS)) {
-        if (plopter.failsafe.adsb) {
-            check_failed(ARMING_CHECK_PARAMETERS, true, "ADSB threat detected");
-            return false;
-        }
-    }
-#endif
-
-    // check throttle
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_RC)) {
-         #if FRAME_CONFIG == HELI_FRAME
-        const char *rc_item = "Collective";
-        #else
-        const char *rc_item = "Throttle";
-        #endif
-        // check throttle is not too low - must be above failsafe throttle
-        if (plopter.g.failsafe_throttle != FS_THR_DISABLED && plopter.channel_throttle->get_radio_in() < plopter.g.failsafe_throttle_value) {
-            check_failed(ARMING_CHECK_RC, true, "%s below failsafe", rc_item);
-            return false;
-        }
-
-        // check throttle is not too high - skips checks if arming from GCS in Guided
-        if (!(method == AP_Arming::Method::MAVLINK && (plopter.flightmode->mode_number() == Mode::Number::GUIDED || plopter.flightmode->mode_number() == Mode::Number::GUIDED_NOGPS))) {
-            // above top of deadband is too always high
-            if (plopter.get_pilot_desired_climb_rate(plopter.channel_throttle->get_control_in()) > 0.0f) {
-                check_failed(ARMING_CHECK_RC, true, "%s too high", rc_item);
-                return false;
-            }
-            // in manual modes throttle must be at zero
-            #if FRAME_CONFIG != HELI_FRAME
-            if ((plopter.flightmode->has_manual_throttle() || plopter.flightmode->mode_number() == Mode::Number::DRIFT) && plopter.channel_throttle->get_control_in() > 0) {
-                check_failed(ARMING_CHECK_RC, true, "%s too high", rc_item);
-                return false;
-            }
-            #endif
-        }
-    }
-
-    // check if safety switch has been pushed
-    if (hal.util->safety_switch_state() == AP_HAL::Util::SAFETY_DISARMED) {
-        check_failed(true, "Safety Switch");
-        return false;
-    }
-
-    // superclass method should always be the last thing called; it
-    // has side-effects which would need to be cleaned up if one of
-    // our arm checks failed
+    // call parent class checks
     return AP_Arming::arm_checks(method);
 }
 
-// mandatory checks that will be run if ARMING_CHECK is zero or arming forced
-bool AP_Arming_Plopter::mandatory_checks(bool display_failure)
+/*
+  update HAL soft arm state
+*/
+void AP_Arming_Plopter::change_arm_state(void)
 {
-    // call mandatory gps checks and update notify status because regular gps checks will not run
-    bool result = mandatory_gps_checks(display_failure);
-    AP_Notify::flags.pre_arm_gps_check = result;
-
-    // call mandatory alt check
-    if (!alt_checks(display_failure)) {
-        result = false;
-    }
-
-    return result & AP_Arming::mandatory_checks(display_failure);
-}
-
-void AP_Arming_Plopter::set_pre_arm_check(bool b)
-{
-    plopter.ap.pre_arm_check = b;
-    AP_Notify::flags.pre_arm_check = b;
+    update_soft_armed();
+#if HAL_QUADPLANE_ENABLED
+    plopter.quadplopter.set_armed(hal.util->get_soft_armed());
+#endif
 }
 
 bool AP_Arming_Plopter::arm(const AP_Arming::Method method, const bool do_arming_checks)
 {
-    static bool in_arm_motors = false;
-
-    // exit immediately if already in this function
-    if (in_arm_motors) {
-        return false;
-    }
-    in_arm_motors = true;
-
-    // return true if already armed
-    if (plopter.motors->armed()) {
-        in_arm_motors = false;
-        return true;
-    }
-
     if (!AP_Arming::arm(method, do_arming_checks)) {
-        AP_Notify::events.arming_failed = true;
-        in_arm_motors = false;
         return false;
     }
 
-    // let logger know that we're armed (it may open logs e.g.)
-    AP::logger().set_vehicle_armed(true);
+    change_arm_state();
 
-    // disable cpu failsafe because initialising everything takes a while
-    plopter.failsafe_disable();
+    // rising edge of delay_arming oneshot
+    delay_arming = true;
 
-    // notify that arming will occur (we do this early to give plenty of warning)
-    AP_Notify::flags.armed = true;
-    // call notify update a few times to ensure the message gets out
-    for (uint8_t i=0; i<=10; i++) {
-        AP::notify().update();
-    }
+    gcs().send_text(MAV_SEVERITY_INFO, "Throttle armed");
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    gcs().send_text(MAV_SEVERITY_INFO, "Arming motors");
-#endif
-
-    // Remember Orientation
-    // --------------------
-    plopter.init_simple_bearing();
-
-    auto &ahrs = AP::ahrs();
-
-    plopter.initial_armed_bearing = ahrs.yaw_sensor;
-
-    if (!ahrs.home_is_set()) {
-        // Reset EKF altitude if home hasn't been set yet (we use EKF altitude as substitute for alt above home)
-        ahrs.resetHeightDatum();
-        AP::logger().Write_Event(LogEvent::EKF_ALT_RESET);
-
-        // we have reset height, so arming height is zero
-        plopter.arming_altitude_m = 0;
-    } else if (!ahrs.home_is_locked()) {
-        // Reset home position if it has already been set before (but not locked)
-        if (!plopter.set_home_to_current_location(false)) {
-            // ignore failure
-        }
-
-        // remember the height when we armed
-        plopter.arming_altitude_m = plopter.inertial_nav.get_position_z_up_cm() * 0.01;
-    }
-    plopter.update_super_simple_bearing(false);
-
-    // Reset SmartRTL return location. If activated, SmartRTL will ultimately try to land at this point
-#if MODE_SMARTRTL_ENABLED == ENABLED
-    plopter.g2.smart_rtl.set_home(plopter.position_ok());
-#endif
-
-    hal.util->set_soft_armed(true);
-
-#if SPRAYER_ENABLED == ENABLED
-    // turn off sprayer's test if on
-    plopter.sprayer.test_pump(false);
-#endif
-
-    // enable output to motors
-    plopter.enable_motor_output();
-
-    // finally actually arm the motors
-    plopter.motors->armed(true);
-
-    // log flight mode in case it was changed while vehicle was disarmed
-    AP::logger().Write_Mode((uint8_t)plopter.flightmode->mode_number(), plopter.control_mode_reason);
-
-    // re-enable failsafe
-    plopter.failsafe_enable();
-
-    // perf monitor ignores delay due to arming
-    AP::scheduler().perf_info.ignore_this_loop();
-
-    // flag exiting this function
-    in_arm_motors = false;
-
-    // Log time stamp of arming event
-    plopter.arm_time_ms = millis();
-
-    // Start the arming delay
-    plopter.ap.in_arming_delay = true;
-
-    // assumed armed without a arming, switch. Overridden in switches.cpp
-    plopter.ap.armed_with_airmode_switch = false;
-
-    // return success
     return true;
 }
 
-// arming.disarm - disarm motors
+/*
+  disarm motors
+ */
 bool AP_Arming_Plopter::disarm(const AP_Arming::Method method, bool do_disarm_checks)
 {
-    // return immediately if we are already disarmed
-    if (!plopter.motors->armed()) {
-        return true;
-    }
-
-    // do not allow disarm via mavlink if we think we are flying:
     if (do_disarm_checks &&
-        method == AP_Arming::Method::MAVLINK &&
-        !plopter.ap.land_complete) {
-        return false;
+        (method == AP_Arming::Method::MAVLINK ||
+         method == AP_Arming::Method::RUDDER)) {
+        if (plopter.is_flying()) {
+            // don't allow mavlink or rudder disarm while flying
+            return false;
+        }
+    }
+    
+    if (do_disarm_checks && method == AP_Arming::Method::RUDDER) {
+        // option must be enabled:
+        if (get_rudder_arming_type() != AP_Arming::RudderArming::ARMDISARM) {
+            gcs().send_text(MAV_SEVERITY_INFO, "Rudder disarm: disabled");
+            return false;
+        }
     }
 
     if (!AP_Arming::disarm(method, do_disarm_checks)) {
         return false;
     }
-
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    gcs().send_text(MAV_SEVERITY_INFO, "Disarming motors");
-#endif
-
-    auto &ahrs = AP::ahrs();
-
-    // save compass offsets learned by the EKF if enabled
-    Compass &compass = AP::compass();
-    if (ahrs.use_compass() && compass.get_learn_type() == Compass::LEARN_EKF) {
-        for(uint8_t i=0; i<COMPASS_MAX_INSTANCES; i++) {
-            Vector3f magOffsets;
-            if (ahrs.getMagOffsets(i, magOffsets)) {
-                compass.set_and_save_offsets(i, magOffsets);
-            }
-        }
+    if (plopter.control_mode != &plopter.mode_auto) {
+        // reset the mission on disarm if we are not in auto
+        plopter.mission.reset();
     }
 
-#if AUTOTUNE_ENABLED == ENABLED
-    // save auto tuned parameters
-    if (plopter.flightmode == &plopter.mode_autotune) {
-        plopter.mode_autotune.save_tuning_gains();
+    // suppress the throttle in auto-throttle modes
+    plopter.throttle_suppressed = plopter.control_mode->does_auto_throttle();
+
+    // if no airmode switch assigned, ensure airmode is off:
+#if HAL_QUADPLANE_ENABLED
+    if ((plopter.quadplopter.air_mode == AirMode::ON) && (rc().find_channel_for_option(RC_Channel::AUX_FUNC::AIRMODE) == nullptr)) {
+        plopter.quadplopter.air_mode = AirMode::OFF;
+    }
+#endif
+
+    //only log if disarming was successful
+    change_arm_state();
+
+#if QAUTOTUNE_ENABLED
+    //save qautotune gains if enabled and success
+    if (plopter.control_mode == &plopter.mode_qautotune) {
+        plopter.quadplopter.qautotune.save_tuning_gains();
     } else {
-        plopter.mode_autotune.reset();
+        plopter.quadplopter.qautotune.reset();
     }
 #endif
 
-    // we are not in the air
-    plopter.set_land_complete(true);
-    plopter.set_land_complete_maybe(true);
-
-    // send disarm command to motors
-    plopter.motors->armed(false);
-
-#if MODE_AUTO_ENABLED == ENABLED
-    // reset the mission
-    plopter.mode_auto.mission.reset();
-#endif
-
-    AP::logger().set_vehicle_armed(false);
-
-    hal.util->set_soft_armed(false);
-
-    plopter.ap.in_arming_delay = false;
+    // re-initialize speed variable used in AUTO and GUIDED for
+    // DO_CHANGE_SPEED commands
+    plopter.new_airspeed_cm = -1;
+    
+    gcs().send_text(MAV_SEVERITY_INFO, "Throttle disarmed");
 
     return true;
+}
+
+void AP_Arming_Plopter::update_soft_armed()
+{
+    bool _armed = is_armed();
+#if HAL_QUADPLANE_ENABLED
+    if (plopter.quadplopter.motor_test.running){
+        _armed = true;
+    }
+#endif
+    _armed = _armed && hal.util->safety_switch_state() != AP_HAL::Util::SAFETY_DISARMED;
+
+    hal.util->set_soft_armed(_armed);
+    AP::logger().set_vehicle_armed(hal.util->get_soft_armed());
+
+    // update delay_arming oneshot
+    if (delay_arming &&
+        (AP_HAL::millis() - hal.util->get_last_armed_change() >= AP_ARMING_DELAY_MS)) {
+
+        delay_arming = false;
+    }
+}
+
+/*
+  extra plopter mission checks
+ */
+bool AP_Arming_Plopter::mission_checks(bool report)
+{
+    // base checks
+    bool ret = AP_Arming::mission_checks(report);
+    if (plopter.mission.get_landing_sequence_start() > 0 && plopter.g.rtl_autoland == RtlAutoland::RTL_DISABLE) {
+        ret = false;
+        check_failed(ARMING_CHECK_MISSION, report, "DO_LAND_START set and RTL_AUTOLAND disabled");
+    }
+    return ret;
 }

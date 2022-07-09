@@ -1,229 +1,285 @@
 #include "Plopter.h"
 
-Mode::_TakeOff Mode::takeoff;
-
-bool Mode::auto_takeoff_no_nav_active = false;
-float Mode::auto_takeoff_no_nav_alt_cm = 0;
-float Mode::auto_takeoff_start_alt_cm = 0;
-float Mode::auto_takeoff_complete_alt_cm = 0;
-bool Mode::auto_takeoff_terrain_alt = false;
-bool Mode::auto_takeoff_complete = false;
-Vector3p Mode::auto_takeoff_complete_pos;
-
-// This file contains the high-level takeoff logic for Loiter, PosHold, AltHold, Sport modes.
-//   The take-off can be initiated from a GCS NAV_TAKEOFF command which includes a takeoff altitude
-//   A safe takeoff speed is calculated and used to calculate a time_ms
-//   the pos_control target is then slowly increased until time_ms expires
-
-bool Mode::do_user_takeoff_start(float takeoff_alt_cm)
+/*   Check for automatic takeoff conditions being met using the following sequence:
+ *   1) Check for adequate GPS lock - if not return false
+ *   2) Check the gravity compensated longitudinal acceleration against the threshold and start the timer if true
+ *   3) Wait until the timer has reached the specified value (increments of 0.1 sec) and then check the GPS speed against the threshold
+ *   4) If the GPS speed is above the threshold and the attitude is within limits then return true and reset the timer
+ *   5) If the GPS speed and attitude within limits has not been achieved after 2.5 seconds, return false and reset the timer
+ *   6) If the time lapsed since the last timecheck is greater than 0.2 seconds, return false and reset the timer
+ *   NOTE : This function relies on the TECS 50Hz processing for its acceleration measure.
+ */
+bool Plopter::auto_takeoff_check(void)
 {
-    plopter.flightmode->takeoff.start(takeoff_alt_cm);
-    return true;
-}
+    // this is a more advanced check that relies on TECS
+    uint32_t now = millis();
+    uint16_t wait_time_ms = MIN(uint16_t(g.takeoff_throttle_delay)*100,12700);
 
-// initiate user takeoff - called when MAVLink TAKEOFF command is received
-bool Mode::do_user_takeoff(float takeoff_alt_cm, bool must_navigate)
-{
-    if (!plopter.motors->armed()) {
-        return false;
-    }
-    if (!plopter.ap.land_complete) {
-        // can't takeoff again!
-        return false;
-    }
-    if (!has_user_takeoff(must_navigate)) {
-        // this mode doesn't support user takeoff
-        return false;
-    }
-    if (takeoff_alt_cm <= plopter.current_loc.alt) {
-        // can't takeoff downwards...
+    // reset all takeoff state if disarmed
+    if (!hal.util->get_soft_armed()) {
+        memset(&takeoff_state, 0, sizeof(takeoff_state));
+        auto_state.baro_takeoff_alt = barometer.get_altitude();
         return false;
     }
 
-    // Vehicles using motor interlock should return false if motor interlock is disabled.
-    // Interlock must be enabled to allow the controller to spool up the motor(s) for takeoff.
-    if (!motors->get_interlock() && plopter.ap.using_interlock) {
+    // Reset states if process has been interrupted
+    if (takeoff_state.last_check_ms && (now - takeoff_state.last_check_ms) > 200) {
+        memset(&takeoff_state, 0, sizeof(takeoff_state));
         return false;
     }
 
-    if (!do_user_takeoff_start(takeoff_alt_cm)) {
+    takeoff_state.last_check_ms = now;
+
+    // Check for bad GPS
+    if (gps.status() < AP_GPS::GPS_OK_FIX_3D) {
+        // no auto takeoff without GPS lock
         return false;
     }
 
-    plopter.set_auto_armed(true);
-    return true;
-}
+    bool do_takeoff_attitude_check = !(g2.flight_options & FlightOptions::DISABLE_TOFF_ATTITUDE_CHK);
+#if HAL_QUADPLANE_ENABLED
+    // disable attitude check on tailsitters
+    do_takeoff_attitude_check = !quadplopter.tailsitter.enabled();
+#endif
 
-// start takeoff to specified altitude above home in centimeters
-void Mode::_TakeOff::start(float alt_cm)
-{
-    // indicate we are taking off
-    plopter.set_land_complete(false);
-    // tell position controller to reset alt target and reset I terms
-    plopter.flightmode->set_throttle_takeoff();
-
-    // initialise takeoff state
-    _running = true;
-    take_off_start_alt = plopter.pos_control->get_pos_target_z_cm();
-    take_off_complete_alt  = take_off_start_alt + alt_cm;
-}
-
-// stop takeoff
-void Mode::_TakeOff::stop()
-{
-    _running = false;
-}
-
-// do_pilot_takeoff - controls the vertical position controller during the process of taking off
-//  take off is complete when the vertical target reaches the take off altitude.
-//  climb is cancelled if pilot_climb_rate_cm becomes negative
-//  sets take off to complete when target altitude is within 1% of the take off altitude
-void Mode::_TakeOff::do_pilot_takeoff(float& pilot_climb_rate_cm)
-{
-    // return pilot_climb_rate if take-off inactive
-    if (!_running) {
-        return;
-    }
-
-    float pos_z = take_off_complete_alt;
-    float vel_z = pilot_climb_rate_cm;
-
-    // command the aircraft to the take off altitude and current pilot climb rate
-    plopter.pos_control->input_pos_vel_accel_z(pos_z, vel_z, 0);
-
-    // stop take off early and return if negative climb rate is commanded or we are within 0.1% of our take off altitude
-    if (is_negative(pilot_climb_rate_cm) ||
-        (take_off_complete_alt  - take_off_start_alt) * 0.999f < plopter.pos_control->get_pos_target_z_cm() - take_off_start_alt) {
-        stop();
-    }
-}
-
-// auto_takeoff_run - controls the vertical position controller during the process of taking off in auto modes
-// auto_takeoff_complete set to true when target altitude is within 10% of the take off altitude and less than 50% max climb rate
-void Mode::auto_takeoff_run()
-{
-    // if not armed set throttle to zero and exit immediately
-    if (!motors->armed() || !plopter.ap.auto_armed) {
-        // do not spool down tradheli when on the ground with motor interlock enabled
-        make_safe_ground_handling(plopter.is_tradheli() && motors->get_interlock());
-        return;
-    }
-
-    // get terrain offset
-    float terr_offset = 0.0f;
-    if (auto_takeoff_terrain_alt && !wp_nav->get_terrain_offset(terr_offset)) {
-        gcs().send_text(MAV_SEVERITY_CRITICAL, "auto takeoff: failed to get terrain offset");
-        return;
-    }
-
-    // set motors to full range
-    motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
-
-    // process pilot's yaw input
-    float target_yaw_rate = 0;
-    if (!plopter.failsafe.radio && plopter.flightmode->use_pilot_yaw()) {
-        // get pilot's desired yaw rate
-        target_yaw_rate = get_pilot_desired_yaw_rate(channel_yaw->norm_input_dz());
-        if (!is_zero(target_yaw_rate)) {
-            auto_yaw.set_mode(AUTO_YAW_HOLD);
+    if (!takeoff_state.launchTimerStarted && !is_zero(g.takeoff_throttle_min_accel)) {
+        // we are requiring an X acceleration event to launch
+        float xaccel = TECS_controller.get_VXdot();
+        if (g2.takeoff_throttle_accel_count <= 1) {
+            if (xaccel < g.takeoff_throttle_min_accel) {
+                goto no_launch;
+            }
+        } else {
+            // we need multiple accel events
+            if (now - takeoff_state.accel_event_ms > 500) {
+                takeoff_state.accel_event_counter = 0;
+            }
+            bool odd_event = ((takeoff_state.accel_event_counter & 1) != 0);
+            bool got_event = (odd_event?xaccel < -g.takeoff_throttle_min_accel : xaccel > g.takeoff_throttle_min_accel);
+            if (got_event) {
+                takeoff_state.accel_event_counter++;
+                takeoff_state.accel_event_ms = now;
+            }
+            if (takeoff_state.accel_event_counter < g2.takeoff_throttle_accel_count) {
+                goto no_launch;
+            }
         }
     }
 
-    // aircraft stays in landed state until rotor speed run up has finished
-    if (motors->get_spool_state() == AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
-        set_land_complete(false);
-    } else {
-        // motors have not completed spool up yet so relax navigation and position controllers
-        pos_control->relax_velocity_controller_xy();
-        pos_control->update_xy_controller();
-        pos_control->relax_z_controller(0.0f);   // forces throttle output to decay to zero
-        pos_control->update_z_controller();
-        attitude_control->reset_yaw_target_and_rate();
-        attitude_control->reset_rate_controller_I_terms();
-        attitude_control->input_thrust_vector_rate_heading(pos_control->get_thrust_vector(), auto_yaw.rate_cds());
+    // we've reached the acceleration threshold, so start the timer
+    if (!takeoff_state.launchTimerStarted) {
+        takeoff_state.launchTimerStarted = true;
+        takeoff_state.last_tkoff_arm_time = now;
+        if (now - takeoff_state.last_report_ms > 2000) {
+            gcs().send_text(MAV_SEVERITY_INFO, "Armed AUTO, xaccel = %.1f m/s/s, waiting %.1f sec",
+                              (double)TECS_controller.get_VXdot(), (double)(wait_time_ms*0.001f));
+            takeoff_state.last_report_ms = now;
+        }
+    }
+
+    // Only perform velocity check if not timed out
+    if ((now - takeoff_state.last_tkoff_arm_time) > wait_time_ms+100U) {
+        if (now - takeoff_state.last_report_ms > 2000) {
+            gcs().send_text(MAV_SEVERITY_WARNING, "Timeout AUTO");
+            takeoff_state.last_report_ms = now;
+        }
+        goto no_launch;
+    }
+
+    if (do_takeoff_attitude_check) {
+        // Check aircraft attitude for bad launch
+        if (ahrs.pitch_sensor <= -3000 || ahrs.pitch_sensor >= 4500 ||
+            (!fly_inverted() && labs(ahrs.roll_sensor) > 3000)) {
+            gcs().send_text(MAV_SEVERITY_WARNING, "Bad launch AUTO");
+            takeoff_state.accel_event_counter = 0;
+            goto no_launch;
+        }
+    }
+
+    // Check ground speed and time delay
+    if (((gps.ground_speed() > g.takeoff_throttle_min_speed || is_zero(g.takeoff_throttle_min_speed))) &&
+        ((now - takeoff_state.last_tkoff_arm_time) >= wait_time_ms)) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Triggered AUTO. GPS speed = %.1f", (double)gps.ground_speed());
+        takeoff_state.launchTimerStarted = false;
+        takeoff_state.last_tkoff_arm_time = 0;
+        takeoff_state.start_time_ms = now;
+        steer_state.locked_course_err = 0; // use current heading without any error offset
+        return true;
+    }
+
+    // we're not launching yet, but the timer is still going
+    return false;
+
+no_launch:
+    takeoff_state.launchTimerStarted = false;
+    takeoff_state.last_tkoff_arm_time = 0;
+    return false;
+}
+
+/*
+  calculate desired bank angle during takeoff, setting nav_roll_cd
+ */
+void Plopter::takeoff_calc_roll(void)
+{
+    if (steer_state.hold_course_cd == -1) {
+        // we don't yet have a heading to hold - just level
+        // the wings until we get up enough speed to get a GPS heading
+        nav_roll_cd = 0;
         return;
     }
 
-    // check if we are not navigating because of low altitude
-    if (auto_takeoff_no_nav_active) {
-        // check if vehicle has reached no_nav_alt threshold
-        if (inertial_nav.get_position_z_up_cm() >= auto_takeoff_no_nav_alt_cm) {
-            auto_takeoff_no_nav_active = false;
+    calc_nav_roll();
+
+    // during takeoff use the level flight roll limit to prevent large
+    // wing strike. Slowly allow for more roll as we get higher above
+    // the takeoff altitude
+    float roll_limit = roll_limit_cd*0.01f;
+    float baro_alt = barometer.get_altitude();
+    // below 5m use the LEVEL_ROLL_LIMIT
+    const float lim1 = 5;    
+    // at 15m allow for full roll
+    const float lim2 = 15;
+    if ((baro_alt < auto_state.baro_takeoff_alt+lim1) || (auto_state.highest_airspeed < g.takeoff_rotate_speed)) {
+        roll_limit = g.level_roll_limit;
+    } else if (baro_alt < auto_state.baro_takeoff_alt+lim2) {
+        float proportion = (baro_alt - (auto_state.baro_takeoff_alt+lim1)) / (lim2 - lim1);
+        roll_limit = (1-proportion) * g.level_roll_limit + proportion * roll_limit;
+    }
+    nav_roll_cd = constrain_int32(nav_roll_cd, -roll_limit*100UL, roll_limit*100UL);
+}
+
+        
+/*
+  calculate desired pitch angle during takeoff, setting nav_pitch_cd
+ */
+void Plopter::takeoff_calc_pitch(void)
+{
+    if (auto_state.highest_airspeed < g.takeoff_rotate_speed) {
+        // we have not reached rotate speed, use a target pitch of 5
+        // degrees. This should be enough to get the tail off the
+        // ground, while making it unlikely that overshoot in the
+        // pitch controller will cause a prop strike
+        nav_pitch_cd = 500;
+        return;
+    }
+
+    if (ahrs.airspeed_sensor_enabled()) {
+        int16_t takeoff_pitch_min_cd = get_takeoff_pitch_min_cd();
+        calc_nav_pitch();
+        if (nav_pitch_cd < takeoff_pitch_min_cd) {
+            nav_pitch_cd = takeoff_pitch_min_cd;
         }
-        pos_control->relax_velocity_controller_xy();
     } else {
-        Vector2f vel;
-        Vector2f accel;
-        pos_control->input_vel_accel_xy(vel, accel);
-    }
-    pos_control->update_xy_controller();
-
-    // command the aircraft to the take off altitude
-    float pos_z = auto_takeoff_complete_alt_cm + terr_offset;
-    float vel_z = 0.0;
-    plopter.pos_control->input_pos_vel_accel_z(pos_z, vel_z, 0.0);
-    
-    // run the vertical position controller and set output throttle
-    pos_control->update_z_controller();
-
-    // call attitude controller
-    if (auto_yaw.mode() == AUTO_YAW_HOLD) {
-        // roll & pitch from position controller, yaw rate from pilot
-        attitude_control->input_thrust_vector_rate_heading(pos_control->get_thrust_vector(), target_yaw_rate);
-    } else if (auto_yaw.mode() == AUTO_YAW_RATE) {
-        // roll & pitch from position controller, yaw rate from mavlink command or mission item
-        attitude_control->input_thrust_vector_rate_heading(pos_control->get_thrust_vector(), auto_yaw.rate_cds());
-    } else {
-        // roll & pitch from position controller, yaw heading from GCS or auto_heading()
-        attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.yaw(), auto_yaw.rate_cds());
+        if (g.takeoff_rotate_speed > 0) {
+            // Rise off ground takeoff so delay rotation until ground speed indicates adequate airspeed
+            nav_pitch_cd = ((gps.ground_speed()*100) / (float)aparm.airspeed_cruise_cm) * auto_state.takeoff_pitch_cd;
+            nav_pitch_cd = constrain_int32(nav_pitch_cd, 500, auto_state.takeoff_pitch_cd); 
+        } else {
+            // Doing hand or catapult launch so need at least 5 deg pitch to prevent initial height loss
+            nav_pitch_cd = MAX(auto_state.takeoff_pitch_cd, 500);
+        }
     }
 
-    // handle takeoff completion
-    bool reached_altitude = (plopter.pos_control->get_pos_target_z_cm() - auto_takeoff_start_alt_cm) >= ((auto_takeoff_complete_alt_cm + terr_offset - auto_takeoff_start_alt_cm) * 0.90);
-    bool reached_climb_rate = plopter.pos_control->get_vel_desired_cms().z < plopter.pos_control->get_max_speed_up_cms() * 0.1;
-    auto_takeoff_complete = reached_altitude && reached_climb_rate;
-
-    // calculate completion for location in case it is needed for a smooth transition to wp_nav
-    if (auto_takeoff_complete) {
-        const Vector3p& complete_pos = plopter.pos_control->get_pos_target_cm();
-        auto_takeoff_complete_pos = Vector3p{complete_pos.x, complete_pos.y, pos_z};
+    if (aparm.stall_prevention != 0) {
+        if (mission.get_current_nav_cmd().id == MAV_CMD_NAV_TAKEOFF ||
+            control_mode == &mode_takeoff) {
+            // during takeoff we want to prioritise roll control over
+            // pitch. Apply a reduction in pitch demand if our roll is
+            // significantly off. The aim of this change is to
+            // increase the robustness of hand launches, particularly
+            // in cross-winds. If we start to roll over then we reduce
+            // pitch demand until the roll recovers
+            float roll_error_rad = radians(constrain_float(labs(nav_roll_cd - ahrs.roll_sensor) * 0.01, 0, 90));
+            float reduction = sq(cosf(roll_error_rad));
+            nav_pitch_cd *= reduction;
+        }
     }
 }
 
-void Mode::auto_takeoff_start(float complete_alt_cm, bool terrain_alt)
+/*
+ * get the pitch min used during takeoff. This matches the mission pitch until near the end where it allows it to levels off
+ */
+int16_t Plopter::get_takeoff_pitch_min_cd(void)
 {
-    auto_takeoff_start_alt_cm = inertial_nav.get_position_z_up_cm();
-    auto_takeoff_complete_alt_cm = complete_alt_cm;
-    auto_takeoff_terrain_alt = terrain_alt;
-    auto_takeoff_complete = false;
-    if ((g2.wp_navalt_min > 0) && (is_disarmed_or_landed() || !motors->get_interlock())) {
-        // we are not flying, climb with no navigation to current alt-above-ekf-origin + wp_navalt_min
-        auto_takeoff_no_nav_alt_cm = auto_takeoff_start_alt_cm + g2.wp_navalt_min * 100;
-        auto_takeoff_no_nav_active = true;
-    } else {
-        auto_takeoff_no_nav_active = false;
+    if (flight_stage != AP_Vehicle::FixedWing::FLIGHT_TAKEOFF) {
+        return auto_state.takeoff_pitch_cd;
     }
+
+    int32_t relative_alt_cm = adjusted_relative_altitude_cm();
+    int32_t remaining_height_to_target_cm = (auto_state.takeoff_altitude_rel_cm - relative_alt_cm);
+
+    // seconds to target alt method
+    if (g.takeoff_pitch_limit_reduction_sec > 0) {
+        // if height-below-target has been initialized then use it to create and apply a scaler to the pitch_min
+        if (auto_state.height_below_takeoff_to_level_off_cm != 0) {
+            float scalar = remaining_height_to_target_cm / (float)auto_state.height_below_takeoff_to_level_off_cm;
+            return auto_state.takeoff_pitch_cd * scalar;
+        }
+
+        // are we entering the region where we want to start leveling off before we reach takeoff alt?
+        if (auto_state.sink_rate < -0.1f) {
+            float sec_to_target = (remaining_height_to_target_cm * 0.01f) / (-auto_state.sink_rate);
+            if (sec_to_target > 0 &&
+                relative_alt_cm >= 1000 &&
+                sec_to_target <= g.takeoff_pitch_limit_reduction_sec) {
+                // make a note of that altitude to use it as a start height for scaling
+                gcs().send_text(MAV_SEVERITY_INFO, "Takeoff level-off starting at %dm", int(remaining_height_to_target_cm/100));
+                auto_state.height_below_takeoff_to_level_off_cm = remaining_height_to_target_cm;
+            }
+        }
+    }
+    return auto_state.takeoff_pitch_cd;
 }
 
-// return takeoff final position if takeoff has completed successfully
-bool Mode::auto_takeoff_get_position(Vector3p& complete_pos)
+/*
+  return a tail hold percentage during initial takeoff for a tail
+  dragger
+
+  This can be used either in auto-takeoff or in FBWA mode with
+  FBWA_TDRAG_CHAN enabled
+ */
+int8_t Plopter::takeoff_tail_hold(void)
 {
-    // only provide location if takeoff has completed
-    if (!auto_takeoff_complete) {
-        return false;
+    bool in_takeoff = ((control_mode == &mode_auto && !auto_state.takeoff_complete) ||
+                       (control_mode == &mode_fbwa && auto_state.fbwa_tdrag_takeoff_mode));
+    if (!in_takeoff) {
+        // not in takeoff
+        return 0;
     }
+    if (g.takeoff_tdrag_elevator == 0) {
+        // no takeoff elevator set
+        goto return_zero;
+    }
+    if (auto_state.highest_airspeed >= g.takeoff_tdrag_speed1) {
+        // we've passed speed1. We now raise the tail and aim for
+        // level pitch. Return 0 meaning no fixed elevator setting
+        goto return_zero;
+    }
+    if (ahrs.pitch_sensor > auto_state.initial_pitch_cd + 1000) {
+        // the pitch has gone up by more then 10 degrees over the
+        // initial pitch. This may mean the nose is coming up for an
+        // early liftoff, perhaps due to a bad setting of
+        // g.takeoff_tdrag_speed1. Go to level flight to prevent a
+        // stall
+        goto return_zero;
+    }
+    // we are holding the tail down
+    return g.takeoff_tdrag_elevator;
 
-    complete_pos = auto_takeoff_complete_pos;
-    return true;
+return_zero:
+    if (auto_state.fbwa_tdrag_takeoff_mode) {
+        gcs().send_text(MAV_SEVERITY_NOTICE, "FBWA tdrag off");
+        auto_state.fbwa_tdrag_takeoff_mode = false;
+    }
+    return 0;
 }
 
-bool Mode::is_taking_off() const
+#if LANDING_GEAR_ENABLED == ENABLED
+/*
+  update landing gear
+ */
+void Plopter::landing_gear_update(void)
 {
-    if (!has_user_takeoff(false)) {
-        return false;
-    }
-    if (plopter.ap.land_complete) {
-        return false;
-    }
-    return takeoff.running();
+    g2.landing_gear.update(relative_ground_altitude(g.rangefinder_landing));
 }
+#endif

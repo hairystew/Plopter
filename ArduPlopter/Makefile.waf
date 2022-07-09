@@ -1,2 +1,2 @@
 all:
-	@$(MAKE) -C ../ -f Makefile.waf plopter
+	@$(MAKE) -C ../  -f Makefile.waf plopter

@@ -1,487 +1,300 @@
 #include "Plopter.h"
 
-/*
- *       This event will be called when the failsafe changes
- *       boolean failsafe reflects the current state
- */
-
-bool Plopter::failsafe_option(FailsafeOption opt) const
+// returns true if the vehicle is in landing sequence.  Intended only
+// for use in failsafe code.
+bool Plopter::failsafe_in_landing_sequence() const
 {
-    return (g2.fs_options & (uint32_t)opt);
+    if (flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND) {
+        return true;
+    }
+#if HAL_QUADPLANE_ENABLED
+    if (quadplopter.in_vtol_land_sequence()) {
+        return true;
+    }
+#endif
+    return false;
 }
 
-void Plopter::failsafe_radio_on_event()
+void Plopter::failsafe_short_on_event(enum failsafe_state fstype, ModeReason reason)
 {
-    AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_RADIO, LogErrorCode::FAILSAFE_OCCURRED);
+    // This is how to handle a short loss of control signal failsafe.
+    failsafe.state = fstype;
+    failsafe.short_timer_ms = millis();
+    failsafe.saved_mode_number = control_mode->mode_number();
+    gcs().send_text(MAV_SEVERITY_WARNING, "RC Short Failsafe On");
+    switch (control_mode->mode_number())
+    {
+    case Mode::Number::MANUAL:
+    case Mode::Number::STABILIZE:
+    case Mode::Number::ACRO:
+    case Mode::Number::FLY_BY_WIRE_A:
+    case Mode::Number::AUTOTUNE:
+    case Mode::Number::FLY_BY_WIRE_B:
+    case Mode::Number::CRUISE:
+    case Mode::Number::TRAINING:  
+        if(plopter.emergency_landing) {
+            set_mode(mode_fbwa, reason); // emergency landing switch overrides normal action to allow out of range landing
+            break;
+        }
+        if(g.fs_action_short == FS_ACTION_SHORT_FBWA) {
+            set_mode(mode_fbwa, reason);
+        } else if (g.fs_action_short == FS_ACTION_SHORT_FBWB) {
+            set_mode(mode_fbwb, reason);
+        } else {
+            set_mode(mode_circle, reason); // circle if action = 0 or 1 
+        }
+        gcs().send_text(MAV_SEVERITY_INFO, "Flight mode = %s", control_mode->name());
+        break;
 
-    // set desired action based on FS_THR_ENABLE parameter
-    FailsafeAction desired_action;
-    switch (g.failsafe_throttle) {
-        case FS_THR_DISABLED:
-            desired_action = FailsafeAction::NONE;
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QSTABILIZE:
+    case Mode::Number::QLOITER:
+    case Mode::Number::QHOVER:
+#if QAUTOTUNE_ENABLED
+    case Mode::Number::QAUTOTUNE:
+#endif
+    case Mode::Number::QACRO:
+        if (quadplopter.options & QuadPlopter::OPTION_FS_RTL) {
+            set_mode(mode_rtl, reason);
+        } else if (quadplopter.options & QuadPlopter::OPTION_FS_QRTL) {
+            set_mode(mode_qrtl, reason);
+        } else {
+            set_mode(mode_qland, reason);
+        }
+        gcs().send_text(MAV_SEVERITY_INFO, "Flight mode = %s", control_mode->name());
+        break;
+#endif // HAL_QUADPLANE_ENABLED
+
+    case Mode::Number::AUTO: {
+        if (failsafe_in_landing_sequence()) {
+            // don't failsafe in a landing sequence
             break;
-        case FS_THR_ENABLED_ALWAYS_RTL:
-        case FS_THR_ENABLED_CONTINUE_MISSION:
-            desired_action = FailsafeAction::RTL;
-            break;
-        case FS_THR_ENABLED_ALWAYS_SMARTRTL_OR_RTL:
-            desired_action = FailsafeAction::SMARTRTL;
-            break;
-        case FS_THR_ENABLED_ALWAYS_SMARTRTL_OR_LAND:
-            desired_action = FailsafeAction::SMARTRTL_LAND;
-            break;
-        case FS_THR_ENABLED_ALWAYS_LAND:
-            desired_action = FailsafeAction::LAND;
-            break;
-        case FS_THR_ENABLED_AUTO_RTL_OR_RTL:
-            desired_action = FailsafeAction::AUTO_DO_LAND_START;
-            break;
-        default:
-            desired_action = FailsafeAction::LAND;
+        }
+        FALLTHROUGH;
     }
-
-    // Conditions to deviate from FS_THR_ENABLE selection and send specific GCS warning
-    if (should_disarm_on_failsafe()) {
-        // should immediately disarm when we're on the ground
-        announce_failsafe("Radio", "Disarming");
-        arming.disarm(AP_Arming::Method::RADIOFAILSAFE);
-        desired_action = FailsafeAction::NONE;
-
-    } else if (flightmode->is_landing() && ((battery.has_failsafed() && battery.get_highest_failsafe_priority() <= FAILSAFE_LAND_PRIORITY))) {
-        // Allow landing to continue when battery failsafe requires it (not a user option)
-        announce_failsafe("Radio + Battery", "Continuing Landing");
-        desired_action = FailsafeAction::LAND;
-
-    } else if (flightmode->is_landing() && failsafe_option(FailsafeOption::CONTINUE_IF_LANDING)) {
-        // Allow landing to continue when FS_OPTIONS is set to continue landing
-        announce_failsafe("Radio", "Continuing Landing");
-        desired_action = FailsafeAction::LAND;
-
-    } else if (flightmode->mode_number() == Mode::Number::AUTO && failsafe_option(FailsafeOption::RC_CONTINUE_IF_AUTO)) {
-        // Allow mission to continue when FS_OPTIONS is set to continue mission
-        announce_failsafe("Radio", "Continuing Auto");
-        desired_action = FailsafeAction::NONE;
-
-    } else if ((flightmode->in_guided_mode()) && failsafe_option(FailsafeOption::RC_CONTINUE_IF_GUIDED)) {
-        // Allow guided mode to continue when FS_OPTIONS is set to continue in guided mode
-        announce_failsafe("Radio", "Continuing Guided Mode");
-        desired_action = FailsafeAction::NONE;
-
-    } else {
-        announce_failsafe("Radio");
+    case Mode::Number::AVOID_ADSB:
+    case Mode::Number::GUIDED:
+    case Mode::Number::LOITER:
+    case Mode::Number::THERMAL:
+        if (g.fs_action_short != FS_ACTION_SHORT_BESTGUESS) { // if acton = 0(BESTGUESS) this group of modes take no action
+            failsafe.saved_mode_number = control_mode->mode_number();
+            if (g.fs_action_short == FS_ACTION_SHORT_FBWA) {
+                set_mode(mode_fbwa, reason);
+            } else if (g.fs_action_short == FS_ACTION_SHORT_FBWB) {
+                set_mode(mode_fbwb, reason);
+            } else {
+                set_mode(mode_circle, reason);
+            }
+            gcs().send_text(MAV_SEVERITY_INFO, "Flight mode = %s", control_mode->name());
+        }
+         break;
+    case Mode::Number::CIRCLE:  // these modes never take any short failsafe action and continue
+    case Mode::Number::TAKEOFF:
+    case Mode::Number::RTL:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QLAND:
+    case Mode::Number::QRTL:
+    case Mode::Number::LOITER_ALT_QLAND:
+#endif
+    case Mode::Number::INITIALISING:
+        break;
     }
-
-    // Call the failsafe action handler
-    do_failsafe_action(desired_action, ModeReason::RADIO_FAILSAFE);
 }
 
-// failsafe_off_event - respond to radio contact being regained
-void Plopter::failsafe_radio_off_event()
+void Plopter::failsafe_long_on_event(enum failsafe_state fstype, ModeReason reason)
 {
-    // no need to do anything except log the error as resolved
-    // user can now override roll, pitch, yaw and throttle and even use flight mode switch to restore previous flight mode
-    AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_RADIO, LogErrorCode::FAILSAFE_RESOLVED);
-    gcs().send_text(MAV_SEVERITY_WARNING, "Radio Failsafe Cleared");
+    // This is how to handle a long loss of control signal failsafe.
+    if (reason == ModeReason:: GCS_FAILSAFE) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "GCS Failsafe On");
+    }
+    else {
+        gcs().send_text(MAV_SEVERITY_WARNING, "RC Long Failsafe On");
+    }
+    //  If the GCS is locked up we allow control to revert to RC
+    RC_Channels::clear_overrides();
+    failsafe.state = fstype;
+    switch (control_mode->mode_number())
+    {
+    case Mode::Number::MANUAL:
+    case Mode::Number::STABILIZE:
+    case Mode::Number::ACRO:
+    case Mode::Number::FLY_BY_WIRE_A:
+    case Mode::Number::AUTOTUNE:
+    case Mode::Number::FLY_BY_WIRE_B:
+    case Mode::Number::CRUISE:
+    case Mode::Number::TRAINING:
+    case Mode::Number::CIRCLE:
+    case Mode::Number::LOITER:
+    case Mode::Number::THERMAL:
+        if(plopter.emergency_landing) {
+            set_mode(mode_fbwa, reason); // emergency landing switch overrides normal action to allow out of range landing
+            break;
+        }
+        if(g.fs_action_long == FS_ACTION_LONG_PARACHUTE) {
+#if PARACHUTE == ENABLED
+            parachute_release();
+#endif
+        } else if (g.fs_action_long == FS_ACTION_LONG_GLIDE) {
+            set_mode(mode_fbwa, reason);
+        } else {
+            set_mode(mode_rtl, reason);
+        }
+        break;
+
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QSTABILIZE:
+    case Mode::Number::QHOVER:
+    case Mode::Number::QLOITER:
+    case Mode::Number::QACRO:
+#if QAUTOTUNE_ENABLED
+    case Mode::Number::QAUTOTUNE:
+#endif
+        if (quadplopter.options & QuadPlopter::OPTION_FS_RTL) {
+            set_mode(mode_rtl, reason);
+        } else if (quadplopter.options & QuadPlopter::OPTION_FS_QRTL) {
+            set_mode(mode_qrtl, reason);
+        } else {
+            set_mode(mode_qland, reason);
+        }
+        break;
+#endif  // HAL_QUADPLANE_ENABLED
+
+    case Mode::Number::AUTO:
+        if (failsafe_in_landing_sequence()) {
+            // don't failsafe in a landing sequence
+            break;
+        }
+        FALLTHROUGH;
+
+    case Mode::Number::AVOID_ADSB:
+    case Mode::Number::GUIDED:
+        if(g.fs_action_long == FS_ACTION_LONG_PARACHUTE) {
+#if PARACHUTE == ENABLED
+            parachute_release();
+#endif
+        } else if (g.fs_action_long == FS_ACTION_LONG_GLIDE) {
+            set_mode(mode_fbwa, reason);
+        } else if (g.fs_action_long == FS_ACTION_LONG_RTL) {
+            set_mode(mode_rtl, reason);
+        }
+        break;
+
+    case Mode::Number::RTL:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QLAND:
+    case Mode::Number::QRTL:
+    case Mode::Number::LOITER_ALT_QLAND:
+#endif
+    case Mode::Number::TAKEOFF:
+    case Mode::Number::INITIALISING:
+        break;
+    }
+    gcs().send_text(MAV_SEVERITY_INFO, "Flight mode = %s", control_mode->name());
 }
 
-void Plopter::announce_failsafe(const char *type, const char *action_undertaken)
+void Plopter::failsafe_short_off_event(ModeReason reason)
 {
-    if (action_undertaken != nullptr) {
-        gcs().send_text(MAV_SEVERITY_WARNING, "%s Failsafe - %s", type, action_undertaken);
-    } else {
-        gcs().send_text(MAV_SEVERITY_WARNING, "%s Failsafe", type);
+    // We're back in radio contact
+    gcs().send_text(MAV_SEVERITY_WARNING, "Short Failsafe Cleared");
+    failsafe.state = FAILSAFE_NONE;
+    //restore entry mode if desired but check that our current mode is still due to failsafe
+    if ( _last_reason == ModeReason::RADIO_FAILSAFE) { 
+       set_mode_by_number(failsafe.saved_mode_number, ModeReason::RADIO_FAILSAFE_RECOVERY);
+       gcs().send_text(MAV_SEVERITY_INFO,"Flight mode %s restored",control_mode->name());
+     }
+}
+
+void Plopter::failsafe_long_off_event(ModeReason reason)
+{
+    // We're back in radio contact with RC or GCS
+    if (reason == ModeReason:: GCS_FAILSAFE) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "GCS Failsafe Off");
     }
+    else {
+        gcs().send_text(MAV_SEVERITY_WARNING, "RC Long Failsafe Cleared");
+    }
+    failsafe.state = FAILSAFE_NONE;
 }
 
 void Plopter::handle_battery_failsafe(const char *type_str, const int8_t action)
 {
-    AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_BATT, LogErrorCode::FAILSAFE_OCCURRED);
-
-    FailsafeAction desired_action = (FailsafeAction)action;
-
-    // Conditions to deviate from BATT_FS_XXX_ACT parameter setting
-    if (should_disarm_on_failsafe()) {
-        // should immediately disarm when we're on the ground
-        arming.disarm(AP_Arming::Method::BATTERYFAILSAFE);
-        desired_action = FailsafeAction::NONE;
-        announce_failsafe("Battery", "Disarming");
-
-    } else if (flightmode->is_landing() && failsafe_option(FailsafeOption::CONTINUE_IF_LANDING) && desired_action != FailsafeAction::NONE) {
-        // Allow landing to continue when FS_OPTIONS is set to continue when landing
-        desired_action = FailsafeAction::LAND;
-        announce_failsafe("Battery", "Continuing Landing");
-    } else {
-        announce_failsafe("Battery");
-    }
-
-    // Battery FS options already use the Failsafe_Options enum. So use them directly.
-    do_failsafe_action(desired_action, ModeReason::BATTERY_FAILSAFE);
-
-}
-
-// failsafe_gcs_check - check for ground station failsafe
-void Plopter::failsafe_gcs_check()
-{
-    // Bypass GCS failsafe checks if disabled or GCS never connected
-    if (g.failsafe_gcs == FS_GCS_DISABLED) {
-        return;
-    }
-
-    const uint32_t gcs_last_seen_ms = gcs().sysid_myggcs_last_seen_time_ms();
-    if (gcs_last_seen_ms == 0) {
-        return;
-    }
-
-    // calc time since last gcs update
-    // note: this only looks at the heartbeat from the device id set by g.sysid_my_gcs
-    const uint32_t last_gcs_update_ms = millis() - gcs_last_seen_ms;
-    const uint32_t gcs_timeout_ms = uint32_t(constrain_float(g2.fs_gcs_timeout * 1000.0f, 0.0f, UINT32_MAX));
-
-    // Determine which event to trigger
-    if (last_gcs_update_ms < gcs_timeout_ms && failsafe.gcs) {
-        // Recovery from a GCS failsafe
-        set_failsafe_gcs(false);
-        failsafe_gcs_off_event();
-
-    } else if (last_gcs_update_ms < gcs_timeout_ms && !failsafe.gcs) {
-        // No problem, do nothing
-
-    } else if (last_gcs_update_ms > gcs_timeout_ms && failsafe.gcs) {
-        // Already in failsafe, do nothing
-
-    } else if (last_gcs_update_ms > gcs_timeout_ms && !failsafe.gcs) {
-        // New GCS failsafe event, trigger events
-        set_failsafe_gcs(true);
-        failsafe_gcs_on_event();
-    }
-}
-
-// failsafe_gcs_on_event - actions to take when GCS contact is lost
-void Plopter::failsafe_gcs_on_event(void)
-{
-    AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_GCS, LogErrorCode::FAILSAFE_OCCURRED);
-    RC_Channels::clear_overrides();
-
-    // convert the desired failsafe response to the FailsafeAction enum
-    FailsafeAction desired_action;
-    switch (g.failsafe_gcs) {
-        case FS_GCS_DISABLED:
-            desired_action = FailsafeAction::NONE;
-            break;
-        case FS_GCS_ENABLED_ALWAYS_RTL:
-        case FS_GCS_ENABLED_CONTINUE_MISSION:
-            desired_action = FailsafeAction::RTL;
-            break;
-        case FS_GCS_ENABLED_ALWAYS_SMARTRTL_OR_RTL:
-            desired_action = FailsafeAction::SMARTRTL;
-            break;
-        case FS_GCS_ENABLED_ALWAYS_SMARTRTL_OR_LAND:
-            desired_action = FailsafeAction::SMARTRTL_LAND;
-            break;
-        case FS_GCS_ENABLED_ALWAYS_LAND:
-            desired_action = FailsafeAction::LAND;
-            break;
-        case FS_GCS_ENABLED_AUTO_RTL_OR_RTL:
-            desired_action = FailsafeAction::AUTO_DO_LAND_START;
-            break;
-        default: // if an invalid parameter value is set, the fallback is RTL
-            desired_action = FailsafeAction::RTL;
-    }
-
-    // Conditions to deviate from FS_GCS_ENABLE parameter setting
-    if (!motors->armed()) {
-        desired_action = FailsafeAction::NONE;
-        announce_failsafe("GCS");
-
-    } else if (should_disarm_on_failsafe()) {
-        // should immediately disarm when we're on the ground
-        arming.disarm(AP_Arming::Method::GCSFAILSAFE);
-        desired_action = FailsafeAction::NONE;
-        announce_failsafe("GCS", "Disarming");
-
-    } else if (flightmode->is_landing() && ((battery.has_failsafed() && battery.get_highest_failsafe_priority() <= FAILSAFE_LAND_PRIORITY))) {
-        // Allow landing to continue when battery failsafe requires it (not a user option)
-        announce_failsafe("GCS + Battery", "Continuing Landing");
-        desired_action = FailsafeAction::LAND;
-
-    } else if (flightmode->is_landing() && failsafe_option(FailsafeOption::CONTINUE_IF_LANDING)) {
-        // Allow landing to continue when FS_OPTIONS is set to continue landing
-        announce_failsafe("GCS", "Continuing Landing");
-        desired_action = FailsafeAction::LAND;
-
-    } else if (flightmode->mode_number() == Mode::Number::AUTO && failsafe_option(FailsafeOption::GCS_CONTINUE_IF_AUTO)) {
-        // Allow mission to continue when FS_OPTIONS is set to continue mission
-        announce_failsafe("GCS", "Continuing Auto Mode");
-        desired_action = FailsafeAction::NONE;
-
-    } else if (failsafe_option(FailsafeOption::GCS_CONTINUE_IF_PILOT_CONTROL) && !flightmode->is_autopilot()) {
-        // should continue when in a pilot controlled mode because FS_OPTIONS is set to continue in pilot controlled modes
-        announce_failsafe("GCS", "Continuing Pilot Control");
-        desired_action = FailsafeAction::NONE;
-    } else {
-        announce_failsafe("GCS");
-    }
-
-    // Call the failsafe action handler
-    do_failsafe_action(desired_action, ModeReason::GCS_FAILSAFE);
-}
-
-// failsafe_gcs_off_event - actions to take when GCS contact is restored
-void Plopter::failsafe_gcs_off_event(void)
-{
-    gcs().send_text(MAV_SEVERITY_WARNING, "GCS Failsafe Cleared");
-    AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_GCS, LogErrorCode::FAILSAFE_RESOLVED);
-}
-
-// executes terrain failsafe if data is missing for longer than a few seconds
-void Plopter::failsafe_terrain_check()
-{
-    // trigger within <n> milliseconds of failures while in various modes
-    bool timeout = (failsafe.terrain_last_failure_ms - failsafe.terrain_first_failure_ms) > FS_TERRAIN_TIMEOUT_MS;
-    bool trigger_event = timeout && flightmode->requires_terrain_failsafe();
-
-    // check for clearing of event
-    if (trigger_event != failsafe.terrain) {
-        if (trigger_event) {
-            failsafe_terrain_on_event();
-        } else {
-            AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_TERRAIN, LogErrorCode::ERROR_RESOLVED);
-            failsafe.terrain = false;
-        }
-    }
-}
-
-// set terrain data status (found or not found)
-void Plopter::failsafe_terrain_set_status(bool data_ok)
-{
-    uint32_t now = millis();
-
-    // record time of first and latest failures (i.e. duration of failures)
-    if (!data_ok) {
-        failsafe.terrain_last_failure_ms = now;
-        if (failsafe.terrain_first_failure_ms == 0) {
-            failsafe.terrain_first_failure_ms = now;
-        }
-    } else {
-        // failures cleared after 0.1 seconds of persistent successes
-        if (now - failsafe.terrain_last_failure_ms > 100) {
-            failsafe.terrain_last_failure_ms = 0;
-            failsafe.terrain_first_failure_ms = 0;
-        }
-    }
-}
-
-// terrain failsafe action
-void Plopter::failsafe_terrain_on_event()
-{
-    failsafe.terrain = true;
-    gcs().send_text(MAV_SEVERITY_CRITICAL,"Failsafe: Terrain data missing");
-    AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_TERRAIN, LogErrorCode::FAILSAFE_OCCURRED);
-
-    if (should_disarm_on_failsafe()) {
-        arming.disarm(AP_Arming::Method::TERRAINFAILSAFE);
-#if MODE_RTL_ENABLED == ENABLED
-    } else if (flightmode->mode_number() == Mode::Number::RTL) {
-        mode_rtl.restart_without_terrain();
-#endif
-    } else {
-        set_mode_RTL_or_land_with_pause(ModeReason::TERRAIN_FAILSAFE);
-    }
-}
-
-// check for gps glitch failsafe
-void Plopter::gpsglitch_check()
-{
-    // get filter status
-    nav_filter_status filt_status = inertial_nav.get_filter_status();
-    bool gps_glitching = filt_status.flags.gps_glitching;
-
-    // log start or stop of gps glitch.  AP_Notify update is handled from within AP_AHRS
-    if (ap.gps_glitching != gps_glitching) {
-        ap.gps_glitching = gps_glitching;
-        if (gps_glitching) {
-            AP::logger().Write_Error(LogErrorSubsystem::GPS, LogErrorCode::GPS_GLITCH);
-            gcs().send_text(MAV_SEVERITY_CRITICAL,"GPS Glitch or Compass error");
-        } else {
-            AP::logger().Write_Error(LogErrorSubsystem::GPS, LogErrorCode::ERROR_RESOLVED);
-            gcs().send_text(MAV_SEVERITY_CRITICAL,"Glitch cleared");
-        }
-    }
-}
-
-// dead reckoning alert and failsafe
-void Plopter::failsafe_deadreckon_check()
-{
-    // update dead reckoning state
-    const char* dr_prefix_str = "Dead Reckoning";
-
-    // get EKF filter status
-    bool ekf_dead_reckoning = inertial_nav.get_filter_status().flags.dead_reckoning;
-
-    // alert user to start or stop of dead reckoning
-    const uint32_t now_ms = AP_HAL::millis();
-    if (dead_reckoning.active != ekf_dead_reckoning) {
-        dead_reckoning.active = ekf_dead_reckoning;
-        if (dead_reckoning.active) {
-            dead_reckoning.start_ms = now_ms;
-            gcs().send_text(MAV_SEVERITY_CRITICAL,"%s started", dr_prefix_str);
-        } else {
-            dead_reckoning.start_ms = 0;
-            dead_reckoning.timeout = false;
-            gcs().send_text(MAV_SEVERITY_CRITICAL,"%s stopped", dr_prefix_str);
-        }
-    }
-
-    // check for timeout
-    if (dead_reckoning.active && !dead_reckoning.timeout) {
-        const uint32_t dr_timeout_ms = uint32_t(constrain_float(g2.failsafe_dr_timeout * 1000.0f, 0.0f, UINT32_MAX));
-        if (now_ms - dead_reckoning.start_ms > dr_timeout_ms) {
-            dead_reckoning.timeout = true;
-            gcs().send_text(MAV_SEVERITY_CRITICAL,"%s timeout", dr_prefix_str);
-        }
-    }
-
-    // exit immediately if deadreckon failsafe is disabled
-    if (g2.failsafe_dr_enable <= 0) {
-        failsafe.deadreckon = false;
-        return;
-    }
-
-    // check for failsafe action
-    if (failsafe.deadreckon != ekf_dead_reckoning) {
-        failsafe.deadreckon = ekf_dead_reckoning;
-
-        // only take action in modes requiring position estimate
-        if (failsafe.deadreckon && plopter.flightmode->requires_GPS()) {
-
-            // log error
-            AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_DEADRECKON, LogErrorCode::FAILSAFE_OCCURRED);
-
-            // immediately disarm while landed
-            if (should_disarm_on_failsafe()) {
-                arming.disarm(AP_Arming::Method::DEADRECKON_FAILSAFE);
-                return;
+    switch ((Failsafe_Action)action) {
+#if HAL_QUADPLANE_ENABLED
+        case Failsafe_Action_Loiter_alt_QLand:
+            if (quadplopter.available()) {
+                plopter.set_mode(mode_loiter_qland, ModeReason::BATTERY_FAILSAFE);
+                break;
             }
+            FALLTHROUGH;
 
-            // take user specified action
-            do_failsafe_action((FailsafeAction)g2.failsafe_dr_enable.get(), ModeReason::DEADRECKON_FAILSAFE);
-        }
-    }
-}
-
-// set_mode_RTL_or_land_with_pause - sets mode to RTL if possible or LAND with 4 second delay before descent starts
-//  this is always called from a failsafe so we trigger notification to pilot
-void Plopter::set_mode_RTL_or_land_with_pause(ModeReason reason)
-{
-    // attempt to switch to RTL, if this fails then switch to Land
-    if (!set_mode(Mode::Number::RTL, reason)) {
-        // set mode to land will trigger mode change notification to pilot
-        set_mode_land_with_pause(reason);
-    } else {
-        // alert pilot to mode change
-        AP_Notify::events.failsafe_mode_change = 1;
-    }
-}
-
-// set_mode_SmartRTL_or_land_with_pause - sets mode to SMART_RTL if possible or LAND with 4 second delay before descent starts
-// this is always called from a failsafe so we trigger notification to pilot
-void Plopter::set_mode_SmartRTL_or_land_with_pause(ModeReason reason)
-{
-    // attempt to switch to SMART_RTL, if this failed then switch to Land
-    if (!set_mode(Mode::Number::SMART_RTL, reason)) {
-        gcs().send_text(MAV_SEVERITY_WARNING, "SmartRTL Unavailable, Using Land Mode");
-        set_mode_land_with_pause(reason);
-    } else {
-        AP_Notify::events.failsafe_mode_change = 1;
-    }
-}
-
-// set_mode_SmartRTL_or_RTL - sets mode to SMART_RTL if possible or RTL if possible or LAND with 4 second delay before descent starts
-// this is always called from a failsafe so we trigger notification to pilot
-void Plopter::set_mode_SmartRTL_or_RTL(ModeReason reason)
-{
-    // attempt to switch to SmartRTL, if this failed then attempt to RTL
-    // if that fails, then land
-    if (!set_mode(Mode::Number::SMART_RTL, reason)) {
-        gcs().send_text(MAV_SEVERITY_WARNING, "SmartRTL Unavailable, Trying RTL Mode");
-        set_mode_RTL_or_land_with_pause(reason);
-    } else {
-        AP_Notify::events.failsafe_mode_change = 1;
-    }
-}
-
-// Sets mode to Auto and jumps to DO_LAND_START, as set with AUTO_RTL param
-// This can come from failsafe or RC option
-void Plopter::set_mode_auto_do_land_start_or_RTL(ModeReason reason)
-{
-#if MODE_AUTO_ENABLED == ENABLED
-    if (set_mode(Mode::Number::AUTO_RTL, reason)) {
-        AP_Notify::events.failsafe_mode_change = 1;
-        return;
-    }
+        case Failsafe_Action_QLand:
+            if (quadplopter.available()) {
+                plopter.set_mode(mode_qland, ModeReason::BATTERY_FAILSAFE);
+                break;
+            }
+            FALLTHROUGH;
+#endif // HAL_QUADPLANE_ENABLED
+        case Failsafe_Action_Land: {
+            bool already_landing = flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND;
+#if HAL_QUADPLANE_ENABLED
+            if (control_mode == &mode_qland || control_mode == &mode_loiter_qland) {
+                already_landing = true;
+            }
 #endif
-
-    gcs().send_text(MAV_SEVERITY_WARNING, "Trying RTL Mode");
-    set_mode_RTL_or_land_with_pause(reason);
-}
-
-bool Plopter::should_disarm_on_failsafe() {
-    if (ap.in_arming_delay) {
-        return true;
-    }
-
-    switch (flightmode->mode_number()) {
-        case Mode::Number::STABILIZE:
-        case Mode::Number::ACRO:
-            // if throttle is zero OR vehicle is landed disarm motors
-            return ap.throttle_zero || ap.land_complete;
-        case Mode::Number::AUTO:
-        case Mode::Number::AUTO_RTL:
-            // if mission has not started AND vehicle is landed, disarm motors
-            return !ap.auto_armed && ap.land_complete;
-        default:
-            // used for AltHold, Guided, Loiter, RTL, Circle, Drift, Sport, Flip, Autotune, PosHold
-            // if landed disarm
-            return ap.land_complete;
-    }
-}
-
-
-void Plopter::do_failsafe_action(FailsafeAction action, ModeReason reason){
-
-    // Execute the specified desired_action
-    switch (action) {
-        case FailsafeAction::NONE:
-            return;
-        case FailsafeAction::LAND:
-            set_mode_land_with_pause(reason);
+            if (!already_landing) {
+                // never stop a landing if we were already committed
+                if (plopter.mission.is_best_land_sequence()) {
+                    // continue mission as it will reach a landing in less distance
+                    plopter.mission.set_in_landing_sequence_flag(true);
+                    break;
+                }
+                if (plopter.mission.jump_to_landing_sequence()) {
+                    plopter.set_mode(mode_auto, ModeReason::BATTERY_FAILSAFE);
+                    break;
+                }
+            }
+            FALLTHROUGH;
+        }
+        case Failsafe_Action_RTL: {
+            bool already_landing = flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND;
+#if HAL_QUADPLANE_ENABLED
+            if (control_mode == &mode_qland || control_mode == &mode_loiter_qland ||
+                quadplopter.in_vtol_land_sequence()) {
+                already_landing = true;
+            }
+#endif
+            if (!already_landing) {
+                // never stop a landing if we were already committed
+                if (g.rtl_autoland == RtlAutoland::RTL_IMMEDIATE_DO_LAND_START && plopter.mission.is_best_land_sequence()) {
+                    // continue mission as it will reach a landing in less distance
+                    plopter.mission.set_in_landing_sequence_flag(true);
+                    break;
+                }
+                set_mode(mode_rtl, ModeReason::BATTERY_FAILSAFE);
+                aparm.throttle_cruise.load();
+            }
             break;
-        case FailsafeAction::RTL:
-            set_mode_RTL_or_land_with_pause(reason);
-            break;
-        case FailsafeAction::SMARTRTL:
-            set_mode_SmartRTL_or_RTL(reason);
-            break;
-        case FailsafeAction::SMARTRTL_LAND:
-            set_mode_SmartRTL_or_land_with_pause(reason);
-            break;
-        case FailsafeAction::TERMINATE: {
+        }
+
+        case Failsafe_Action_Terminate:
 #if ADVANCED_FAILSAFE == ENABLED
-            g2.afs.gcs_terminate(true, "Failsafe");
+            char battery_type_str[17];
+            snprintf(battery_type_str, 17, "%s battery", type_str);
+            afs.gcs_terminate(true, battery_type_str);
 #else
             arming.disarm(AP_Arming::Method::FAILSAFE_ACTION_TERMINATE);
 #endif
             break;
-        }
-        case FailsafeAction::AUTO_DO_LAND_START:
-            set_mode_auto_do_land_start_or_RTL(reason);
+
+        case Failsafe_Action_Parachute:
+#if PARACHUTE == ENABLED
+            parachute_release();
+#endif
+            break;
+
+        case Failsafe_Action_None:
+            // don't actually do anything, however we should still flag the system as having hit a failsafe
+            // and ensure all appropriate flags are going off to the user
             break;
     }
-
-#if GRIPPER_ENABLED == ENABLED
-    if (failsafe_option(FailsafeOption::RELEASE_GRIPPER)) {
-        plopter.g2.gripper.release();
-    }
-#endif
 }
-

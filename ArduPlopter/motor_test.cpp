@@ -1,223 +1,138 @@
 #include "Plopter.h"
 
 /*
-  mavlink motor test - implements the MAV_CMD_DO_MOTOR_TEST mavlink command so that the GCS/pilot can test an individual motor or flaps
-                       to ensure proper wiring, rotation.
+  mavlink motor test - implements the MAV_CMD_DO_MOTOR_TEST mavlink
+                       command so that the quadplopter pilot can test an
+                       individual motor to ensure proper wiring, rotation.
  */
 
 // motor test definitions
-#define MOTOR_TEST_PWM_MIN              800     // min pwm value accepted by the test
-#define MOTOR_TEST_PWM_MAX              2200    // max pwm value accepted by the test
-#define MOTOR_TEST_TIMEOUT_SEC          600     // max timeout is 10 minutes (600 seconds)
-
-static uint32_t motor_test_start_ms;        // system time the motor test began
-static uint32_t motor_test_timeout_ms;      // test will timeout this many milliseconds after the motor_test_start_ms
-static uint8_t motor_test_seq;              // motor sequence number of motor being tested
-static uint8_t motor_test_count;            // number of motors to test
-static uint8_t motor_test_throttle_type;    // motor throttle type (0=throttle percentage, 1=PWM, 2=pilot throttle channel pass-through)
-static float motor_test_throttle_value;  // throttle to be sent to motor, value depends upon it's type
+#define MOTOR_TEST_TIMEOUT_MS_MAX       30000   // max timeout is 30 seconds
 
 // motor_test_output - checks for timeout and sends updates to motors objects
-void Plopter::motor_test_output()
+#if HAL_QUADPLANE_ENABLED
+void QuadPlopter::motor_test_output()
 {
     // exit immediately if the motor test is not running
-    if (!ap.motor_test) {
+    if (!motor_test.running) {
         return;
     }
 
-    EXPECT_DELAY_MS(2000);
-
     // check for test timeout
     uint32_t now = AP_HAL::millis();
-    if ((now - motor_test_start_ms) >= motor_test_timeout_ms) {
-        if (motor_test_count > 1) {
-            if (now - motor_test_start_ms < motor_test_timeout_ms*1.5) {
-                // output zero for 50% of the test time
+    if ((now - motor_test.start_ms) >= motor_test.timeout_ms) {
+        if (motor_test.motor_count > 1) {
+            if (now - motor_test.start_ms < motor_test.timeout_ms*1.5) {
+                // output zero for 0.5s
                 motors->output_min();
             } else {
                 // move onto next motor
-                motor_test_seq++;
-                motor_test_count--;
-                motor_test_start_ms = now;
-                if (!motors->armed()) {
-                    motors->armed(true);
-                    hal.util->set_soft_armed(true);
-                }
+                motor_test.seq++;
+                motor_test.motor_count--;
+                motor_test.start_ms = now;
             }
             return;
         }
         // stop motor test
         motor_test_stop();
+        return;
+    }
+            
+    int16_t pwm = 0;   // pwm that will be output to the motors
+
+    // calculate pwm based on throttle type
+    const int16_t thr_min_pwm = motors->get_pwm_output_min();
+    const int16_t thr_max_pwm = motors->get_pwm_output_max();
+
+    switch (motor_test.throttle_type) {
+    case MOTOR_TEST_THROTTLE_PERCENT:
+        // sanity check motor_test.throttle value
+        if (motor_test.throttle_value <= 100) {
+            pwm = thr_min_pwm + (thr_max_pwm - thr_min_pwm) * (float)motor_test.throttle_value*0.01f;
+        }
+        break;
+
+    case MOTOR_TEST_THROTTLE_PWM:
+        pwm = motor_test.throttle_value;
+        break;
+
+    case MOTOR_TEST_THROTTLE_PILOT:
+        pwm = thr_min_pwm + (thr_max_pwm - thr_min_pwm) * plopter.get_throttle_input()*0.01f;
+        break;
+
+    default:
+        motor_test_stop();
+        return;
+    }
+
+    // sanity check throttle values
+    if (pwm >= RC_Channel::RC_MIN_LIMIT_PWM && pwm <= RC_Channel::RC_MAX_LIMIT_PWM) {
+        // turn on motor to specified pwm vlaue
+        motors->output_test_seq(motor_test.seq, pwm);
     } else {
-        int16_t pwm = 0;   // pwm that will be output to the motors
-
-        // calculate pwm based on throttle type
-        switch (motor_test_throttle_type) {
-
-            case MOTOR_TEST_COMPASS_CAL:
-                compass.set_voltage(battery.voltage());
-                compass.per_motor_calibration_update();
-                FALLTHROUGH;
-
-            case MOTOR_TEST_THROTTLE_PERCENT:
-                // sanity check motor_test_throttle value
-#if FRAME_CONFIG != HELI_FRAME
-                if (motor_test_throttle_value <= 100) {
-                    int16_t pwm_min = motors->get_pwm_output_min();
-                    int16_t pwm_max = motors->get_pwm_output_max();
-                    pwm = (int16_t) (pwm_min + (pwm_max - pwm_min) * motor_test_throttle_value * 1e-2f);
-                }
-#endif
-                break;
-
-            case MOTOR_TEST_THROTTLE_PWM:
-                pwm = (int16_t)motor_test_throttle_value;
-                break;
-
-            case MOTOR_TEST_THROTTLE_PILOT:
-                pwm = channel_throttle->get_radio_in();
-                break;
-
-            default:
-                motor_test_stop();
-                return;
-        }
-
-        // sanity check throttle values
-        if (pwm >= MOTOR_TEST_PWM_MIN && pwm <= MOTOR_TEST_PWM_MAX ) {
-            // turn on motor to specified pwm value
-            motors->output_test_seq(motor_test_seq, pwm);
-        } else {
-            motor_test_stop();
-        }
+        motor_test_stop();
     }
-}
-
-// mavlink_motor_test_check - perform checks before motor tests can begin
-//  return true if tests can continue, false if not
-bool Plopter::mavlink_motor_control_check(const GCS_MAVLINK &gcs_chan, bool check_rc, const char* mode)
-{
-    // check board has initialised
-    if (!ap.initialised) {
-        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: Board initialising", mode);
-        return false;
-    }
-
-    // check rc has been calibrated
-    if (check_rc && !arming.rc_calibration_checks(true)) {
-        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: RC not calibrated", mode);
-        return false;
-    }
-
-    // ensure we are landed
-    if (!ap.land_complete) {
-        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: vehicle not landed", mode);
-        return false;
-    }
-
-    // check if safety switch has been pushed
-    if (hal.util->safety_switch_state() == AP_HAL::Util::SAFETY_DISARMED) {
-        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: Safety switch", mode);
-        return false;
-    }
-
-    // check E-Stop is not active
-    if (SRV_Channels::get_emergency_stop()) {
-        gcs_chan.send_text(MAV_SEVERITY_CRITICAL,"%s: Motor Emergency Stopped", mode);
-        return false;
-    }
-
-    // if we got this far the check was successful and the motor test can continue
-    return true;
 }
 
 // mavlink_motor_test_start - start motor test - spin a single motor at a specified pwm
 //  returns MAV_RESULT_ACCEPTED on success, MAV_RESULT_FAILED on failure
-MAV_RESULT Plopter::mavlink_motor_test_start(const GCS_MAVLINK &gcs_chan, uint8_t motor_seq, uint8_t throttle_type, float throttle_value,
-                                         float timeout_sec, uint8_t motor_count)
+MAV_RESULT QuadPlopter::mavlink_motor_test_start(mavlink_channel_t chan, uint8_t motor_seq, uint8_t throttle_type,
+                                            uint16_t throttle_value, float timeout_sec, uint8_t motor_count)
 {
-    if (motor_count == 0) {
-        motor_count = 1;
+    if (!available() || motors == nullptr) {
+        return MAV_RESULT_FAILED;
+    }
+
+    if (motors->armed()) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Must be disarmed for motor test");
+        return MAV_RESULT_FAILED;
     }
     // if test has not started try to start it
-    if (!ap.motor_test) {
-        /* perform checks that it is ok to start test
-           The RC calibrated check can be skipped if direct pwm is
-           supplied
-        */
-        if (!mavlink_motor_control_check(gcs_chan, throttle_type != 1, "Motor Test")) {
-            return MAV_RESULT_FAILED;
-        } else {
-            // start test
-            gcs().send_text(MAV_SEVERITY_INFO, "starting motor test");
-            ap.motor_test = true;
+    if (!motor_test.running) {
+        // start test
+        motor_test.running = true;
 
-            EXPECT_DELAY_MS(3000);
-            // enable and arm motors
-            if (!motors->armed()) {
-                enable_motor_output();
-                motors->armed(true);
-                hal.util->set_soft_armed(true);
-            }
-
-            // disable throttle and gps failsafe
-            g.failsafe_throttle = FS_THR_DISABLED;
-            g.failsafe_gcs = FS_GCS_DISABLED;
-            g.fs_ekf_action = 0;
-
-            // turn on notify leds
-            AP_Notify::flags.esc_calibration = true;
-        }
+        // enable and arm motors
+        set_armed(true);
+        
+        // turn on notify leds
+        AP_Notify::flags.esc_calibration = true;
     }
 
     // set timeout
-    motor_test_start_ms = AP_HAL::millis();
-    motor_test_timeout_ms = MIN(timeout_sec, MOTOR_TEST_TIMEOUT_SEC) * 1000;
+    motor_test.start_ms = AP_HAL::millis();
+    motor_test.timeout_ms = MIN(timeout_sec * 1000, MOTOR_TEST_TIMEOUT_MS_MAX);
 
     // store required output
-    motor_test_seq = motor_seq;
-    motor_test_count = motor_count;
-    motor_test_throttle_type = throttle_type;
-    motor_test_throttle_value = throttle_value;
-
-    if (motor_test_throttle_type == MOTOR_TEST_COMPASS_CAL) {
-        compass.per_motor_calibration_start();
-    }            
+    motor_test.seq = motor_seq;
+    motor_test.throttle_type = throttle_type;
+    motor_test.throttle_value = throttle_value;
+    motor_test.motor_count = MIN(motor_count, 8);
 
     // return success
     return MAV_RESULT_ACCEPTED;
 }
 
 // motor_test_stop - stops the motor test
-void Plopter::motor_test_stop()
+void QuadPlopter::motor_test_stop()
 {
     // exit immediately if the test is not running
-    if (!ap.motor_test) {
+    if (!motor_test.running) {
         return;
     }
 
-    gcs().send_text(MAV_SEVERITY_INFO, "finished motor test");    
-
     // flag test is complete
-    ap.motor_test = false;
+    motor_test.running = false;
 
     // disarm motors
-    motors->armed(false);
-    hal.util->set_soft_armed(false);
+    set_armed(false);
 
     // reset timeout
-    motor_test_start_ms = 0;
-    motor_test_timeout_ms = 0;
-
-    // re-enable failsafes
-    g.failsafe_throttle.load();
-    g.failsafe_gcs.load();
-    g.fs_ekf_action.load();
-
-    if (motor_test_throttle_type == MOTOR_TEST_COMPASS_CAL) {
-        compass.per_motor_calibration_end();
-    }
+    motor_test.start_ms = 0;
+    motor_test.timeout_ms = 0;
 
     // turn off notify leds
     AP_Notify::flags.esc_calibration = false;
 }
+
+#endif  // HAL_QUADPLANE_ENABLED

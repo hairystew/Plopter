@@ -2,61 +2,44 @@
 
 #include <AP_Arming/AP_Arming.h>
 
+/*
+  a plopter specific arming class
+ */
 class AP_Arming_Plopter : public AP_Arming
 {
 public:
-    friend class Plopter;
-    friend class ToyMode;
-
-    AP_Arming_Plopter() : AP_Arming()
+    AP_Arming_Plopter()
+        : AP_Arming()
     {
-        // default REQUIRE parameter to 1 (Plopter does not have an
-        // actual ARMING_REQUIRE parameter)
-        require.set_default((uint8_t)Required::YES_MIN_PWM);
+        AP_Param::setup_object_defaults(this, var_info);
     }
 
     /* Do not allow copies */
     AP_Arming_Plopter(const AP_Arming_Plopter &other) = delete;
     AP_Arming_Plopter &operator=(const AP_Arming_Plopter&) = delete;
 
-    void update(void);
+    bool pre_arm_checks(bool report) override;
+    bool arm_checks(AP_Arming::Method method) override;
 
-    bool rc_calibration_checks(bool display_failure) override;
+    // var_info for holding Parameter information
+    static const struct AP_Param::GroupInfo var_info[];
 
     bool disarm(AP_Arming::Method method, bool do_disarm_checks=true) override;
     bool arm(AP_Arming::Method method, bool do_arming_checks=true) override;
 
+    void update_soft_armed();
+    bool get_delay_arming() const { return delay_arming; };
+
 protected:
+    bool ins_checks(bool report) override;
 
-    bool pre_arm_checks(bool display_failure) override;
-    bool pre_arm_ekf_attitude_check();
-    bool proximity_checks(bool display_failure) const override;
-    bool arm_checks(AP_Arming::Method method) override;
-
-    // mandatory checks that cannot be bypassed.  This function will only be called if ARMING_CHECK is zero or arming forced
-    bool mandatory_checks(bool display_failure) override;
-
-    // NOTE! the following check functions *DO* call into AP_Arming:
-    bool ins_checks(bool display_failure) override;
-    bool gps_checks(bool display_failure) override;
-    bool barometer_checks(bool display_failure) override;
-    bool board_voltage_checks(bool display_failure) override;
-
-    // NOTE! the following check functions *DO NOT* call into AP_Arming!
-    bool parameter_checks(bool display_failure);
-    bool motor_checks(bool display_failure);
-    bool oa_checks(bool display_failure);
-    bool mandatory_gps_checks(bool display_failure);
-    bool gcs_failsafe_check(bool display_failure);
-    bool winch_checks(bool display_failure) const;
-    bool alt_checks(bool display_failure);
-
-    void set_pre_arm_check(bool b);
+    bool quadplopter_checks(bool display_failure);
+    bool mission_checks(bool report) override;
 
 private:
+    void change_arm_state(void);
 
-    // actually contains the pre-arm checks.  This is wrapped so that
-    // we can store away success/failure of the checks.
-    bool run_pre_arm_checks(bool display_failure);
-
+    // oneshot with duration AP_ARMING_DELAY_MS used by quadplopter to delay spoolup after arming:
+    // ignored unless OPTION_DELAY_ARMING or OPTION_TILT_DISARMED is set
+    bool delay_arming;
 };

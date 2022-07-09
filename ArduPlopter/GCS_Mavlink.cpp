@@ -1,18 +1,20 @@
-#include "Plopter.h"
-
 #include "GCS_Mavlink.h"
+
+#include "Plopter.h"
 
 MAV_TYPE GCS_Plopter::frame_type() const
 {
-    if (plopter.motors == nullptr) {
-        return MAV_TYPE_GENERIC;
-    }
-    return plopter.motors->get_frame_mav_type();
+#if HAL_QUADPLANE_ENABLED
+    return plopter.quadplopter.get_mav_type();
+#else
+    return MAV_TYPE_FIXED_WING;
+#endif
 }
 
 MAV_MODE GCS_MAVLINK_Plopter::base_mode() const
 {
-    uint8_t _base_mode = MAV_MODE_FLAG_STABILIZE_ENABLED;
+    uint8_t _base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+
     // work out the base_mode. This value is not very useful
     // for APM, but we calculate it as best we can so a generic
     // MAVLink enabled ground station can work out something about
@@ -20,34 +22,73 @@ MAV_MODE GCS_MAVLINK_Plopter::base_mode() const
     // ambiguous for most of the APM flight modes. In practice, you
     // only get useful information from the custom_mode, which maps to
     // the APM flight mode and has a well defined meaning in the
-    // ArduPlane documentation
-    switch (plopter.flightmode->mode_number()) {
-        case Mode::Number::AUTO:
-        case Mode::Number::AUTO_RTL:
-        case Mode::Number::RTL:
-        case Mode::Number::LOITER:
-        case Mode::Number::AVOID_ADSB:
-        case Mode::Number::FOLLOW:
-        case Mode::Number::GUIDED:
-        case Mode::Number::CIRCLE:
-        case Mode::Number::POSHOLD:
-        case Mode::Number::BRAKE:
-        case Mode::Number::SMART_RTL:
-            _base_mode |= MAV_MODE_FLAG_GUIDED_ENABLED;
-            // note that MAV_MODE_FLAG_AUTO_ENABLED does not match what
-            // APM does in any mode, as that is defined as "system finds its own goal
-            // positions", which APM does not currently do
-            break;
-        default:
-            break;
+    // ArduPlopter documentation
+    switch (plopter.control_mode->mode_number()) {
+    case Mode::Number::MANUAL:
+    case Mode::Number::TRAINING:
+    case Mode::Number::ACRO:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QACRO:
+        _base_mode = MAV_MODE_FLAG_MANUAL_INPUT_ENABLED;
+        break;
+#endif
+    case Mode::Number::STABILIZE:
+    case Mode::Number::FLY_BY_WIRE_A:
+    case Mode::Number::AUTOTUNE:
+    case Mode::Number::FLY_BY_WIRE_B:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QSTABILIZE:
+    case Mode::Number::QHOVER:
+    case Mode::Number::QLOITER:
+    case Mode::Number::QLAND:
+#if QAUTOTUNE_ENABLED
+    case Mode::Number::QAUTOTUNE:
+#endif
+#endif  // HAL_QUADPLANE_ENABLED
+    case Mode::Number::CRUISE:
+        _base_mode = MAV_MODE_FLAG_STABILIZE_ENABLED;
+        break;
+    case Mode::Number::AUTO:
+    case Mode::Number::RTL:
+    case Mode::Number::LOITER:
+    case Mode::Number::THERMAL:
+    case Mode::Number::AVOID_ADSB:
+    case Mode::Number::GUIDED:
+    case Mode::Number::CIRCLE:
+    case Mode::Number::TAKEOFF:
+#if HAL_QUADPLANE_ENABLED
+    case Mode::Number::QRTL:
+    case Mode::Number::LOITER_ALT_QLAND:
+#endif
+        _base_mode = MAV_MODE_FLAG_GUIDED_ENABLED |
+                     MAV_MODE_FLAG_STABILIZE_ENABLED;
+        // note that MAV_MODE_FLAG_AUTO_ENABLED does not match what
+        // APM does in any mode, as that is defined as "system finds its own goal
+        // positions", which APM does not currently do
+        break;
+    case Mode::Number::INITIALISING:
+        break;
     }
 
-    // all modes except INITIALISING have some form of manual
-    // override if stick mixing is enabled
-    _base_mode |= MAV_MODE_FLAG_MANUAL_INPUT_ENABLED;
+    if (!plopter.training_manual_pitch || !plopter.training_manual_roll) {
+        _base_mode |= MAV_MODE_FLAG_STABILIZE_ENABLED;        
+    }
+
+    if (plopter.control_mode != &plopter.mode_manual && plopter.control_mode != &plopter.mode_initializing) {
+        // stabiliser of some form is enabled
+        _base_mode |= MAV_MODE_FLAG_STABILIZE_ENABLED;
+    }
+
+    if (plopter.g.stick_mixing != StickMixing::NONE && plopter.control_mode != &plopter.mode_initializing) {
+        if ((plopter.g.stick_mixing != StickMixing::VTOL_YAW) || (plopter.control_mode == &plopter.mode_auto)) {
+            // all modes except INITIALISING have some form of manual
+            // override if stick mixing is enabled
+            _base_mode |= MAV_MODE_FLAG_MANUAL_INPUT_ENABLED;
+        }
+    }
 
     // we are armed if we are not initialising
-    if (plopter.motors != nullptr && plopter.motors->armed()) {
+    if (plopter.control_mode != &plopter.mode_initializing && plopter.arming.is_armed()) {
         _base_mode |= MAV_MODE_FLAG_SAFETY_ARMED;
     }
 
@@ -59,190 +100,214 @@ MAV_MODE GCS_MAVLINK_Plopter::base_mode() const
 
 uint32_t GCS_Plopter::custom_mode() const
 {
-    return (uint32_t)plopter.flightmode->mode_number();
+    return plopter.control_mode->mode_number();
 }
 
 MAV_STATE GCS_MAVLINK_Plopter::vehicle_system_status() const
 {
-    // set system as critical if any failsafe have triggered
-    if (plopter.any_failsafe_triggered())  {
+    if (plopter.control_mode == &plopter.mode_initializing) {
+        return MAV_STATE_CALIBRATING;
+    }
+    if (plopter.any_failsafe_triggered()) {
         return MAV_STATE_CRITICAL;
     }
-
-    if (plopter.ap.land_complete) {
-        return MAV_STATE_STANDBY;
+    if (plopter.crash_state.is_crashed) {
+        return MAV_STATE_EMERGENCY;
+    }
+    if (plopter.is_flying()) {
+        return MAV_STATE_ACTIVE;
     }
 
-    return MAV_STATE_ACTIVE;
+    return MAV_STATE_STANDBY;
 }
 
 
-void GCS_MAVLINK_Plopter::send_attitude_target()
+void GCS_MAVLINK_Plopter::send_attitude() const
 {
-    const Quaternion quat  = plopter.attitude_control->get_attitude_target_quat();
-    const Vector3f ang_vel = plopter.attitude_control->get_attitude_target_ang_vel();
-    const float thrust = plopter.attitude_control->get_throttle_in();
+    const AP_AHRS &ahrs = AP::ahrs();
 
-    const float quat_out[4] {quat.q1, quat.q2, quat.q3, quat.q4};
+    float r = ahrs.roll;
+    float p = ahrs.pitch;
+    float y = ahrs.yaw;
 
-    // Note: When sending out the attitude_target info. we send out all of info. no matter the mavlink typemask
-    // This way we send out the maximum information that can be used by the sending control systems to adapt their generated trajectories
-    const uint16_t typemask = 0;    // Ignore nothing
-
-    mavlink_msg_attitude_target_send(
-            chan,
-            AP_HAL::millis(),       // time since boot (ms)
-            typemask,               // Bitmask that tells the system what control dimensions should be ignored by the vehicle
-            quat_out,               // Attitude quaternion [w, x, y, z] order, zero-rotation is [1, 0, 0, 0], unit-length
-            ang_vel.x,              // roll rate (rad/s)
-            ang_vel.y,              // pitch rate (rad/s)
-            ang_vel.z,              // yaw rate (rad/s)
-            thrust);                // Collective thrust, normalized to 0 .. 1
-}
-
-void GCS_MAVLINK_Plopter::send_position_target_global_int()
-{
-    Location target;
-    if (!plopter.flightmode->get_wp(target)) {
-        return;
+    if (!(plopter.g2.flight_options & FlightOptions::GCS_REMOVE_TRIM_PITCH_CD)) {
+        p -= radians(plopter.g.pitch_trim_cd * 0.01f);
     }
 
-    // convert altitude frame to AMSL (this may use the terrain database)
-    if (!target.change_alt_frame(Location::AltFrame::ABSOLUTE)) {
-        return;
+#if HAL_QUADPLANE_ENABLED
+    if (plopter.quadplopter.show_vtol_view()) {
+        r = plopter.quadplopter.ahrs_view->roll;
+        p = plopter.quadplopter.ahrs_view->pitch;
+        y = plopter.quadplopter.ahrs_view->yaw;
     }
-    static constexpr uint16_t POSITION_TARGET_TYPEMASK_LAST_BYTE = 0xF000;
-    static constexpr uint16_t TYPE_MASK = POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE | POSITION_TARGET_TYPEMASK_VZ_IGNORE |
-                                          POSITION_TARGET_TYPEMASK_AX_IGNORE | POSITION_TARGET_TYPEMASK_AY_IGNORE | POSITION_TARGET_TYPEMASK_AZ_IGNORE |
-                                          POSITION_TARGET_TYPEMASK_YAW_IGNORE | POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE | POSITION_TARGET_TYPEMASK_LAST_BYTE;
-    mavlink_msg_position_target_global_int_send(
-            chan,
-            AP_HAL::millis(), // time_boot_ms
-            MAV_FRAME_GLOBAL, // targets are always global altitude
-            TYPE_MASK, // ignore everything except the x/y/z components
-            target.lat, // latitude as 1e7
-            target.lng, // longitude as 1e7
-            target.alt * 0.01f, // altitude is sent as a float
-            0.0f, // vx
-            0.0f, // vy
-            0.0f, // vz
-            0.0f, // afx
-            0.0f, // afy
-            0.0f, // afz
-            0.0f, // yaw
-            0.0f); // yaw_rate
-}
-
-void GCS_MAVLINK_Plopter::send_position_target_local_ned()
-{
-#if MODE_GUIDED_ENABLED == ENABLED
-    if (!plopter.flightmode->in_guided_mode()) {
-        return;
-    }
-
-    const ModeGuided::SubMode guided_mode = plopter.mode_guided.submode();
-    Vector3f target_pos;
-    Vector3f target_vel;
-    Vector3f target_accel;
-    uint16_t type_mask = 0;
-
-    switch (guided_mode) {
-        case ModeGuided::SubMode::Angle:
-            // we don't have a local target when in angle mode
-            return;
-        case ModeGuided::SubMode::TakeOff:
-        case ModeGuided::SubMode::WP:
-        case ModeGuided::SubMode::Pos:
-            type_mask = POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE | POSITION_TARGET_TYPEMASK_VZ_IGNORE |
-                        POSITION_TARGET_TYPEMASK_AX_IGNORE | POSITION_TARGET_TYPEMASK_AY_IGNORE | POSITION_TARGET_TYPEMASK_AZ_IGNORE |
-                        POSITION_TARGET_TYPEMASK_YAW_IGNORE| POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE; // ignore everything except position
-            target_pos = plopter.mode_guided.get_target_pos().tofloat() * 0.01; // convert to metres
-            break;
-        case ModeGuided::SubMode::PosVelAccel:
-            type_mask = POSITION_TARGET_TYPEMASK_YAW_IGNORE| POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE; // ignore everything except position, velocity & acceleration
-            target_pos = plopter.mode_guided.get_target_pos().tofloat() * 0.01; // convert to metres
-            target_vel = plopter.mode_guided.get_target_vel() * 0.01f; // convert to metres/s
-            target_accel = plopter.mode_guided.get_target_accel() * 0.01f; // convert to metres/s/s
-            break;
-        case ModeGuided::SubMode::VelAccel:
-            type_mask = POSITION_TARGET_TYPEMASK_X_IGNORE | POSITION_TARGET_TYPEMASK_Y_IGNORE | POSITION_TARGET_TYPEMASK_Z_IGNORE |
-                        POSITION_TARGET_TYPEMASK_YAW_IGNORE| POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE; // ignore everything except velocity & acceleration
-            target_vel = plopter.mode_guided.get_target_vel() * 0.01f; // convert to metres/s
-            target_accel = plopter.mode_guided.get_target_accel() * 0.01f; // convert to metres/s/s
-            break;
-        case ModeGuided::SubMode::Accel:
-            type_mask = POSITION_TARGET_TYPEMASK_X_IGNORE | POSITION_TARGET_TYPEMASK_Y_IGNORE | POSITION_TARGET_TYPEMASK_Z_IGNORE |
-                        POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE | POSITION_TARGET_TYPEMASK_VZ_IGNORE |
-                        POSITION_TARGET_TYPEMASK_YAW_IGNORE| POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE; // ignore everything except velocity & acceleration
-            target_accel = plopter.mode_guided.get_target_accel() * 0.01f; // convert to metres/s/s
-            break;
-    }
-
-    mavlink_msg_position_target_local_ned_send(
-            chan,
-            AP_HAL::millis(), // time boot ms
-            MAV_FRAME_LOCAL_NED,
-            type_mask,
-            target_pos.x,   // x in metres
-            target_pos.y,   // y in metres
-            -target_pos.z,  // z in metres NED frame
-            target_vel.x,   // vx in m/s
-            target_vel.y,   // vy in m/s
-            -target_vel.z,  // vz in m/s NED frame
-            target_accel.x, // afx in m/s/s
-            target_accel.y, // afy in m/s/s
-            -target_accel.z,// afz in m/s/s NED frame
-            0.0f, // yaw
-            0.0f); // yaw_rate
 #endif
+
+    const Vector3f &omega = ahrs.get_gyro();
+    mavlink_msg_attitude_send(
+        chan,
+        millis(),
+        r,
+        p,
+        y,
+        omega.x,
+        omega.y,
+        omega.z);
+}
+
+void GCS_MAVLINK_Plopter::send_aoa_ssa()
+{
+    AP_AHRS &ahrs = AP::ahrs();
+
+    mavlink_msg_aoa_ssa_send(
+        chan,
+        micros(),
+        ahrs.getAOA(),
+        ahrs.getSSA());
 }
 
 void GCS_MAVLINK_Plopter::send_nav_controller_output() const
 {
-    if (!plopter.ap.initialised) {
+    if (plopter.control_mode == &plopter.mode_manual) {
         return;
     }
-    const Vector3f &targets = plopter.attitude_control->get_att_target_euler_cd();
-    const Mode *flightmode = plopter.flightmode;
-    mavlink_msg_nav_controller_output_send(
+#if HAL_QUADPLANE_ENABLED
+    const QuadPlopter &quadplopter = plopter.quadplopter;
+    if (quadplopter.show_vtol_view() && quadplopter.using_wp_nav()) {
+        const Vector3f &targets = quadplopter.attitude_control->get_att_target_euler_cd();
+
+        const Vector2f& curr_pos = quadplopter.inertial_nav.get_position_xy_cm();
+        const Vector2f& target_pos = quadplopter.pos_control->get_pos_target_cm().xy().tofloat();
+        const Vector2f error = (target_pos - curr_pos) * 0.01;
+
+        mavlink_msg_nav_controller_output_send(
             chan,
-            targets.x * 1.0e-2f,
-            targets.y * 1.0e-2f,
-            targets.z * 1.0e-2f,
-            flightmode->wp_bearing() * 1.0e-2f,
-            MIN(flightmode->wp_distance() * 1.0e-2f, UINT16_MAX),
-            plopter.pos_control->get_pos_error_z_cm() * 1.0e-2f,
-            0,
-            flightmode->crosstrack_error() * 1.0e-2f);
+            targets.x * 0.01,
+            targets.y * 0.01,
+            targets.z * 0.01,
+            degrees(error.angle()),
+            MIN(error.length(), UINT16_MAX),
+            (plopter.control_mode != &plopter.mode_qstabilize) ? quadplopter.pos_control->get_pos_error_z_cm() * 0.01 : 0,
+            plopter.airspeed_error * 100,  // incorrect units; see PR#7933
+            quadplopter.wp_nav->crosstrack_error());
+        return;
+    }
+#endif
+    {
+        const AP_Navigation *nav_controller = plopter.nav_controller;
+        mavlink_msg_nav_controller_output_send(
+            chan,
+            plopter.nav_roll_cd * 0.01,
+            plopter.nav_pitch_cd * 0.01,
+            nav_controller->nav_bearing_cd() * 0.01,
+            nav_controller->target_bearing_cd() * 0.01,
+            MIN(plopter.auto_state.wp_distance, UINT16_MAX),
+            plopter.altitude_error_cm * 0.01,
+            plopter.airspeed_error * 100,  // incorrect units; see PR#7933
+            nav_controller->crosstrack_error());
+    }
 }
+
+void GCS_MAVLINK_Plopter::send_position_target_global_int()
+{
+    if (plopter.control_mode == &plopter.mode_manual) {
+        return;
+    }
+    Location &next_WP_loc = plopter.next_WP_loc;
+    static constexpr uint16_t POSITION_TARGET_TYPEMASK_LAST_BYTE = 0xF000;
+    static constexpr uint16_t TYPE_MASK = POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE | POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+                                          POSITION_TARGET_TYPEMASK_AX_IGNORE | POSITION_TARGET_TYPEMASK_AY_IGNORE | POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+                                          POSITION_TARGET_TYPEMASK_YAW_IGNORE | POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE | POSITION_TARGET_TYPEMASK_LAST_BYTE;
+    int32_t alt = 0;
+    if (!next_WP_loc.is_zero()) {
+        UNUSED_RESULT(next_WP_loc.get_alt_cm(Location::AltFrame::ABSOLUTE, alt));
+    }
+
+    mavlink_msg_position_target_global_int_send(
+        chan,
+        AP_HAL::millis(), // time_boot_ms
+        MAV_FRAME_GLOBAL, // targets are always global altitude
+        TYPE_MASK, // ignore everything except the x/y/z components
+        next_WP_loc.lat, // latitude as 1e7
+        next_WP_loc.lng, // longitude as 1e7
+        alt * 0.01, // altitude is sent as a float
+        0.0f, // vx
+        0.0f, // vy
+        0.0f, // vz
+        0.0f, // afx
+        0.0f, // afy
+        0.0f, // afz
+        0.0f, // yaw
+        0.0f); // yaw_rate
+}
+
 
 float GCS_MAVLINK_Plopter::vfr_hud_airspeed() const
 {
-#if AP_AIRSPEED_ENABLED
-    // airspeed sensors are best. While the AHRS airspeed_estimate
+    // airspeed sensors are best.  While the AHRS airspeed_estimate
     // will use an airspeed sensor, that value is constrained by the
-    // ground speed. When reporting we should send the true airspeed
+    // ground speed.  When reporting we should send the true airspeed
     // value if possible:
+#if AP_AIRSPEED_ENABLED
     if (plopter.airspeed.enabled() && plopter.airspeed.healthy()) {
         return plopter.airspeed.get_airspeed();
     }
 #endif
 
-    Vector3f airspeed_vec_bf;
-    if (AP::ahrs().airspeed_vector_true(airspeed_vec_bf)) {
-        // we are running the EKF3 wind estimation code which can give
-        // us an airspeed estimate
-        return airspeed_vec_bf.length();
+    // airspeed estimates are OK:
+    float aspeed;
+    if (AP::ahrs().airspeed_estimate(aspeed)) {
+        return aspeed;
     }
-    return AP::gps().ground_speed();
+
+    // lying is worst:
+    return 0;
 }
 
 int16_t GCS_MAVLINK_Plopter::vfr_hud_throttle() const
 {
-    if (plopter.motors == nullptr) {
-        return 0;
+    return plopter.throttle_percentage();
+}
+
+float GCS_MAVLINK_Plopter::vfr_hud_climbrate() const
+{
+#if HAL_SOARING_ENABLED
+    if (plopter.g2.soaring_controller.is_active()) {
+        return plopter.g2.soaring_controller.get_vario_reading();
     }
-    return (int16_t)(plopter.motors->get_throttle() * 100);
+#endif
+    return GCS_MAVLINK::vfr_hud_climbrate();
+}
+
+void GCS_MAVLINK_Plopter::send_wind() const
+{
+    const Vector3f wind = AP::ahrs().wind_estimate();
+    mavlink_msg_wind_send(
+        chan,
+        degrees(atan2f(-wind.y, -wind.x)), // use negative, to give
+                                          // direction wind is coming from
+        wind.length(),
+        wind.z);
+}
+
+// sends a single pid info over the provided channel
+void GCS_MAVLINK_Plopter::send_pid_info(const AP_PIDInfo *pid_info,
+                          const uint8_t axis, const float achieved)
+{
+    if (pid_info == nullptr) {
+        return;
+    }
+    if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {
+        return;
+    }
+     mavlink_msg_pid_tuning_send(chan, axis,
+                                 pid_info->target,
+                                 achieved,
+                                 pid_info->FF,
+                                 pid_info->P,
+                                 pid_info->I,
+                                 pid_info->D,
+                                 pid_info->slew_rate,
+                                 pid_info->Dmod);
 }
 
 /*
@@ -250,62 +315,57 @@ int16_t GCS_MAVLINK_Plopter::vfr_hud_throttle() const
  */
 void GCS_MAVLINK_Plopter::send_pid_tuning()
 {
-    static const PID_TUNING_AXIS axes[] = {
-            PID_TUNING_ROLL,
-            PID_TUNING_PITCH,
-            PID_TUNING_YAW,
-            PID_TUNING_ACCZ
-    };
-    for (uint8_t i=0; i<ARRAY_SIZE(axes); i++) {
-        if (!(plopter.g.gcs_pid_mask & (1<<(axes[i]-1)))) {
-            continue;
-        }
-        if (!HAVE_PAYLOAD_SPACE(chan, PID_TUNING)) {
-            return;
-        }
-        const AP_PIDInfo *pid_info = nullptr;
-        switch (axes[i]) {
-            case PID_TUNING_ROLL:
-                pid_info = &plopter.attitude_control->get_rate_roll_pid().get_pid_info();
-                break;
-            case PID_TUNING_PITCH:
-                pid_info = &plopter.attitude_control->get_rate_pitch_pid().get_pid_info();
-                break;
-            case PID_TUNING_YAW:
-                pid_info = &plopter.attitude_control->get_rate_yaw_pid().get_pid_info();
-                break;
-            case PID_TUNING_ACCZ:
-                pid_info = &plopter.pos_control->get_accel_z_pid().get_pid_info();
-                break;
-            default:
-                continue;
-        }
-        if (pid_info != nullptr) {
-            mavlink_msg_pid_tuning_send(chan,
-                                        axes[i],
-                                        pid_info->target,
-                                        pid_info->actual,
-                                        pid_info->FF,
-                                        pid_info->P,
-                                        pid_info->I,
-                                        pid_info->D,
-                                        pid_info->slew_rate,
-                                        pid_info->Dmod);
-        }
-    }
-}
-
-// send winch status message
-void GCS_MAVLINK_Plopter::send_winch_status() const
-{
-#if WINCH_ENABLED == ENABLED
-    AP_Winch *winch = AP::winch();
-    if (winch == nullptr) {
+    if (plopter.control_mode == &plopter.mode_manual) {
+        // no PIDs should be used in manual
         return;
     }
-    winch->send_status(*this);
+
+    const Parameters &g = plopter.g;
+
+    const AP_PIDInfo *pid_info;
+    if (g.gcs_pid_mask & TUNING_BITS_ROLL) {
+        pid_info = &plopter.rollController.get_pid_info();
+#if HAL_QUADPLANE_ENABLED
+        if (plopter.quadplopter.in_vtol_mode()) {
+            pid_info = &plopter.quadplopter.attitude_control->get_rate_roll_pid().get_pid_info();
+        }
 #endif
-}
+        send_pid_info(pid_info, PID_TUNING_ROLL, pid_info->actual);
+    }
+    if (g.gcs_pid_mask & TUNING_BITS_PITCH) {
+        pid_info = &plopter.pitchController.get_pid_info();
+#if HAL_QUADPLANE_ENABLED
+        if (plopter.quadplopter.in_vtol_mode()) {
+            pid_info = &plopter.quadplopter.attitude_control->get_rate_pitch_pid().get_pid_info();
+        }
+#endif
+        send_pid_info(pid_info, PID_TUNING_PITCH, pid_info->actual);
+    }
+    if (g.gcs_pid_mask & TUNING_BITS_YAW) {
+        pid_info = &plopter.yawController.get_pid_info();
+#if HAL_QUADPLANE_ENABLED
+        if (plopter.quadplopter.in_vtol_mode()) {
+            pid_info = &plopter.quadplopter.attitude_control->get_rate_yaw_pid().get_pid_info();
+        }
+#endif
+        send_pid_info(pid_info, PID_TUNING_YAW, pid_info->actual);
+    }
+    if (g.gcs_pid_mask & TUNING_BITS_STEER) {
+        pid_info = &plopter.steerController.get_pid_info();
+        send_pid_info(pid_info, PID_TUNING_STEER, pid_info->actual);
+    }
+    if ((g.gcs_pid_mask & TUNING_BITS_LAND) && (plopter.flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND)) {
+        AP_AHRS &ahrs = AP::ahrs();
+        const Vector3f &gyro = ahrs.get_gyro();
+        send_pid_info(plopter.landing.get_pid_info(), PID_TUNING_LANDING, degrees(gyro.z));
+    }
+#if HAL_QUADPLANE_ENABLED
+    if (g.gcs_pid_mask & TUNING_BITS_ACCZ && plopter.quadplopter.in_vtol_mode()) {
+        pid_info = &plopter.quadplopter.pos_control->get_accel_z_pid().get_pid_info();
+        send_pid_info(pid_info, PID_TUNING_ACCZ, pid_info->actual);
+    }
+#endif
+ }
 
 uint8_t GCS_MAVLINK_Plopter::sysid_my_gcs() const
 {
@@ -321,1158 +381,977 @@ uint32_t GCS_MAVLINK_Plopter::telem_delay() const
     return (uint32_t)(plopter.g.telem_delay);
 }
 
-bool GCS_Plopter::vehicle_initialised() const {
-    return plopter.ap.initialised;
-}
-
-// try to send a message, return false if it wasn't sent
+// try to send a message, return false if it won't fit in the serial tx buffer
 bool GCS_MAVLINK_Plopter::try_send_message(enum ap_message id)
 {
-    switch(id) {
+    switch (id) {
 
-        case MSG_TERRAIN:
+    case MSG_SERVO_OUT:
+        // unused
+        break;
+
+    case MSG_TERRAIN:
 #if AP_TERRAIN_AVAILABLE
-            CHECK_PAYLOAD_SIZE(TERRAIN_REQUEST);
+        CHECK_PAYLOAD_SIZE(TERRAIN_REQUEST);
         plopter.terrain.send_request(chan);
 #endif
-            break;
+        break;
 
-        case MSG_WIND:
-            CHECK_PAYLOAD_SIZE(WIND);
-            send_wind();
-            break;
+    case MSG_WIND:
+        CHECK_PAYLOAD_SIZE(WIND);
+        send_wind();
+        break;
 
-        case MSG_SERVO_OUT:
-        case MSG_AOA_SSA:
-        case MSG_LANDING:
-            // unused
-            break;
-
-        case MSG_ADSB_VEHICLE: {
+    case MSG_ADSB_VEHICLE:
 #if HAL_ADSB_ENABLED
-            CHECK_PAYLOAD_SIZE(ADSB_VEHICLE);
+        CHECK_PAYLOAD_SIZE(ADSB_VEHICLE);
         plopter.adsb.send_adsb_vehicle(chan);
 #endif
-#if AC_OAPATHPLANNER_ENABLED == ENABLED
-            AP_OADatabase *oadb = AP_OADatabase::get_singleton();
-            if (oadb != nullptr) {
-                CHECK_PAYLOAD_SIZE(ADSB_VEHICLE);
-                uint16_t interval_ms = 0;
-                if (get_ap_message_interval(id, interval_ms)) {
-                    oadb->send_adsb_vehicle(chan, interval_ms);
-                }
-            }
-#endif
-            break;
-        }
+        break;
 
-        default:
-            return GCS_MAVLINK::try_send_message(id);
+    case MSG_AOA_SSA:
+        CHECK_PAYLOAD_SIZE(AOA_SSA);
+        send_aoa_ssa();
+        break;
+    case MSG_LANDING:
+        plopter.landing.send_landing_message(chan);
+        break;
+    default:
+        return GCS_MAVLINK::try_send_message(id);
     }
     return true;
 }
 
 
+/*
+  default stream rates to 1Hz
+ */
 const AP_Param::GroupInfo GCS_MAVLINK_Parameters::var_info[] = {
-        // @Param: RAW_SENS
-        // @DisplayName: Raw sensor stream rate
-        // @Description: Stream rate of RAW_IMU, SCALED_IMU2, SCALED_IMU3, SCALED_PRESSURE, SCALED_PRESSURE2, SCALED_PRESSURE3 and SENSOR_OFFSETS to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("RAW_SENS", 0, GCS_MAVLINK_Parameters, streamRates[0],  0),
+    // @Param: RAW_SENS
+    // @DisplayName: Raw sensor stream rate
+    // @Description: Raw sensor stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("RAW_SENS", 0, GCS_MAVLINK_Parameters, streamRates[0],  1),
 
-        // @Param: EXT_STAT
-        // @DisplayName: Extended status stream rate to ground station
-        // @Description: Stream rate of SYS_STATUS, POWER_STATUS, MCU_STATUS, MEMINFO, CURRENT_WAYPOINT, GPS_RAW_INT, GPS_RTK (if available), GPS2_RAW (if available), GPS2_RTK (if available), NAV_CONTROLLER_OUTPUT, and FENCE_STATUS to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("EXT_STAT", 1, GCS_MAVLINK_Parameters, streamRates[1],  0),
+    // @Param: EXT_STAT
+    // @DisplayName: Extended status stream rate to ground station
+    // @Description: Extended status stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("EXT_STAT", 1, GCS_MAVLINK_Parameters, streamRates[1],  1),
 
-        // @Param: RC_CHAN
-        // @DisplayName: RC Channel stream rate to ground station
-        // @Description: Stream rate of SERVO_OUTPUT_RAW and RC_CHANNELS to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("RC_CHAN",  2, GCS_MAVLINK_Parameters, streamRates[2],  0),
+    // @Param: RC_CHAN
+    // @DisplayName: RC Channel stream rate to ground station
+    // @Description: RC Channel stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("RC_CHAN",  2, GCS_MAVLINK_Parameters, streamRates[2],  1),
 
-        // @Param: RAW_CTRL
-        // @DisplayName: Unused
-        // @Description: Unused
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("RAW_CTRL", 3, GCS_MAVLINK_Parameters, streamRates[3],  0),
+    // @Param: RAW_CTRL
+    // @DisplayName: Raw Control stream rate to ground station
+    // @Description: Raw Control stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("RAW_CTRL", 3, GCS_MAVLINK_Parameters, streamRates[3],  1),
 
-        // @Param: POSITION
-        // @DisplayName: Position stream rate to ground station
-        // @Description: Stream rate of GLOBAL_POSITION_INT and LOCAL_POSITION_NED to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("POSITION", 4, GCS_MAVLINK_Parameters, streamRates[4],  0),
+    // @Param: POSITION
+    // @DisplayName: Position stream rate to ground station
+    // @Description: Position stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("POSITION", 4, GCS_MAVLINK_Parameters, streamRates[4],  1),
 
-        // @Param: EXTRA1
-        // @DisplayName: Extra data type 1 stream rate to ground station
-        // @Description: Stream rate of ATTITUDE, SIMSTATE (SIM only), AHRS2 and PID_TUNING to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("EXTRA1",   5, GCS_MAVLINK_Parameters, streamRates[5],  0),
+    // @Param: EXTRA1
+    // @DisplayName: Extra data type 1 stream rate to ground station
+    // @Description: Extra data type 1 stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("EXTRA1",   5, GCS_MAVLINK_Parameters, streamRates[5],  1),
 
-        // @Param: EXTRA2
-        // @DisplayName: Extra data type 2 stream rate to ground station
-        // @Description: Stream rate of VFR_HUD to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("EXTRA2",   6, GCS_MAVLINK_Parameters, streamRates[6],  0),
+    // @Param: EXTRA2
+    // @DisplayName: Extra data type 2 stream rate to ground station
+    // @Description: Extra data type 2 stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("EXTRA2",   6, GCS_MAVLINK_Parameters, streamRates[6],  1),
 
-        // @Param: EXTRA3
-        // @DisplayName: Extra data type 3 stream rate to ground station
-        // @Description: Stream rate of AHRS, HWSTATUS, SYSTEM_TIME, RANGEFINDER, DISTANCE_SENSOR, TERRAIN_REQUEST, BATTERY2, MOUNT_STATUS, OPTICAL_FLOW, MAG_CAL_REPORT, MAG_CAL_PROGRESS, EKF_STATUS_REPORT, VIBRATION and RPM to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("EXTRA3",   7, GCS_MAVLINK_Parameters, streamRates[7],  0),
+    // @Param: EXTRA3
+    // @DisplayName: Extra data type 3 stream rate to ground station
+    // @Description: Extra data type 3 stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("EXTRA3",   7, GCS_MAVLINK_Parameters, streamRates[7],  1),
 
-        // @Param: PARAMS
-        // @DisplayName: Parameter stream rate to ground station
-        // @Description: Stream rate of PARAM_VALUE to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("PARAMS",   8, GCS_MAVLINK_Parameters, streamRates[8],  0),
+    // @Param: PARAMS
+    // @DisplayName: Parameter stream rate to ground station
+    // @Description: Parameter stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("PARAMS",   8, GCS_MAVLINK_Parameters, streamRates[8],  10),
 
-        // @Param: ADSB
-        // @DisplayName: ADSB stream rate to ground station
-        // @Description: ADSB stream rate to ground station
-        // @Units: Hz
-        // @Range: 0 50
-        // @Increment: 1
-        // @RebootRequired: True
-        // @User: Advanced
-        AP_GROUPINFO("ADSB",   9, GCS_MAVLINK_Parameters, streamRates[9],  0),
-        AP_GROUPEND
+    // @Param: ADSB
+    // @DisplayName: ADSB stream rate to ground station
+    // @Description: ADSB stream rate to ground station
+    // @Units: Hz
+    // @Range: 0 50
+    // @Increment: 1
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("ADSB",   9, GCS_MAVLINK_Parameters, streamRates[9],  5),
+    AP_GROUPEND
 };
 
 static const ap_message STREAM_RAW_SENSORS_msgs[] = {
-        MSG_RAW_IMU,
-        MSG_SCALED_IMU2,
-        MSG_SCALED_IMU3,
-        MSG_SCALED_PRESSURE,
-        MSG_SCALED_PRESSURE2,
-        MSG_SCALED_PRESSURE3,
+    MSG_RAW_IMU,
+    MSG_SCALED_IMU2,
+    MSG_SCALED_IMU3,
+    MSG_SCALED_PRESSURE,
+    MSG_SCALED_PRESSURE2,
+    MSG_SCALED_PRESSURE3,
 };
 static const ap_message STREAM_EXTENDED_STATUS_msgs[] = {
-        MSG_SYS_STATUS,
-        MSG_POWER_STATUS,
-        MSG_MCU_STATUS,
-        MSG_MEMINFO,
-        MSG_CURRENT_WAYPOINT, // MISSION_CURRENT
-        MSG_GPS_RAW,
-        MSG_GPS_RTK,
-        MSG_GPS2_RAW,
-        MSG_GPS2_RTK,
-        MSG_NAV_CONTROLLER_OUTPUT,
-        MSG_FENCE_STATUS,
-        MSG_POSITION_TARGET_GLOBAL_INT,
+    MSG_SYS_STATUS,
+    MSG_POWER_STATUS,
+    MSG_MCU_STATUS,
+    MSG_MEMINFO,
+    MSG_CURRENT_WAYPOINT,
+    MSG_GPS_RAW,
+    MSG_GPS_RTK,
+    MSG_GPS2_RAW,
+    MSG_GPS2_RTK,
+    MSG_NAV_CONTROLLER_OUTPUT,
+    MSG_FENCE_STATUS,
+    MSG_POSITION_TARGET_GLOBAL_INT,
 };
 static const ap_message STREAM_POSITION_msgs[] = {
-        MSG_LOCATION,
-        MSG_LOCAL_POSITION
+    MSG_LOCATION,
+    MSG_LOCAL_POSITION
+};
+static const ap_message STREAM_RAW_CONTROLLER_msgs[] = {
+    MSG_SERVO_OUT,
 };
 static const ap_message STREAM_RC_CHANNELS_msgs[] = {
-        MSG_SERVO_OUTPUT_RAW,
-        MSG_RC_CHANNELS,
-        MSG_RC_CHANNELS_RAW, // only sent on a mavlink1 connection
+    MSG_SERVO_OUTPUT_RAW,
+    MSG_RC_CHANNELS,
+    MSG_RC_CHANNELS_RAW, // only sent on a mavlink1 connection
 };
 static const ap_message STREAM_EXTRA1_msgs[] = {
-        MSG_ATTITUDE,
-        MSG_SIMSTATE,
-        MSG_AHRS2,
-        MSG_PID_TUNING // Up to four PID_TUNING messages are sent, depending on GCS_PID_MASK parameter
+    MSG_ATTITUDE,
+    MSG_SIMSTATE,
+    MSG_AHRS2,
+    MSG_RPM,
+    MSG_AOA_SSA,
+    MSG_PID_TUNING,
+    MSG_LANDING,
+    MSG_ESC_TELEMETRY,
+    MSG_EFI_STATUS,
 };
 static const ap_message STREAM_EXTRA2_msgs[] = {
-        MSG_VFR_HUD
+    MSG_VFR_HUD
 };
 static const ap_message STREAM_EXTRA3_msgs[] = {
-        MSG_AHRS,
-        MSG_HWSTATUS,
-        MSG_SYSTEM_TIME,
-        MSG_WIND,
-        MSG_RANGEFINDER,
-        MSG_DISTANCE_SENSOR,
+    MSG_AHRS,
+    MSG_HWSTATUS,
+    MSG_WIND,
+    MSG_RANGEFINDER,
+    MSG_DISTANCE_SENSOR,
+    MSG_SYSTEM_TIME,
 #if AP_TERRAIN_AVAILABLE
-        MSG_TERRAIN,
+    MSG_TERRAIN,
 #endif
-        MSG_BATTERY2,
-        MSG_BATTERY_STATUS,
-        MSG_MOUNT_STATUS,
-        MSG_OPTICAL_FLOW,
-        MSG_MAG_CAL_REPORT,
-        MSG_MAG_CAL_PROGRESS,
-        MSG_EKF_STATUS_REPORT,
-        MSG_VIBRATION,
-        MSG_RPM,
-        MSG_ESC_TELEMETRY,
-        MSG_GENERATOR_STATUS,
-        MSG_WINCH_STATUS,
+    MSG_BATTERY2,
+    MSG_BATTERY_STATUS,
+    MSG_MOUNT_STATUS,
+    MSG_OPTICAL_FLOW,
+    MSG_MAG_CAL_REPORT,
+    MSG_MAG_CAL_PROGRESS,
+    MSG_EKF_STATUS_REPORT,
+    MSG_VIBRATION,
 };
 static const ap_message STREAM_PARAMS_msgs[] = {
-        MSG_NEXT_PARAM
+    MSG_NEXT_PARAM
 };
 static const ap_message STREAM_ADSB_msgs[] = {
-        MSG_ADSB_VEHICLE
+    MSG_ADSB_VEHICLE
 };
 
 const struct GCS_MAVLINK::stream_entries GCS_MAVLINK::all_stream_entries[] = {
-        MAV_STREAM_ENTRY(STREAM_RAW_SENSORS),
-        MAV_STREAM_ENTRY(STREAM_EXTENDED_STATUS),
-        MAV_STREAM_ENTRY(STREAM_POSITION),
-        MAV_STREAM_ENTRY(STREAM_RC_CHANNELS),
-        MAV_STREAM_ENTRY(STREAM_EXTRA1),
-        MAV_STREAM_ENTRY(STREAM_EXTRA2),
-        MAV_STREAM_ENTRY(STREAM_EXTRA3),
-        MAV_STREAM_ENTRY(STREAM_ADSB),
-        MAV_STREAM_ENTRY(STREAM_PARAMS),
-        MAV_STREAM_TERMINATOR // must have this at end of stream_entries
+    MAV_STREAM_ENTRY(STREAM_RAW_SENSORS),
+    MAV_STREAM_ENTRY(STREAM_EXTENDED_STATUS),
+    MAV_STREAM_ENTRY(STREAM_POSITION),
+    MAV_STREAM_ENTRY(STREAM_RAW_CONTROLLER),
+    MAV_STREAM_ENTRY(STREAM_RC_CHANNELS),
+    MAV_STREAM_ENTRY(STREAM_EXTRA1),
+    MAV_STREAM_ENTRY(STREAM_EXTRA2),
+    MAV_STREAM_ENTRY(STREAM_EXTRA3),
+    MAV_STREAM_ENTRY(STREAM_PARAMS),
+    MAV_STREAM_ENTRY(STREAM_ADSB),
+    MAV_STREAM_TERMINATOR // must have this at end of stream_entries
 };
 
+/*
+  handle a request to switch to guided mode. This happens via a
+  callback from handle_mission_item()
+ */
 bool GCS_MAVLINK_Plopter::handle_guided_request(AP_Mission::Mission_Command &cmd)
 {
-#if MODE_AUTO_ENABLED == ENABLED
-    return plopter.mode_auto.do_guided(cmd);
-#else
-    return false;
-#endif
+    return plopter.control_mode->handle_guided_request(cmd.content.location);
+}
+
+/*
+  handle a request to change current WP altitude. This happens via a
+  callback from handle_mission_item()
+ */
+void GCS_MAVLINK_Plopter::handle_change_alt_request(AP_Mission::Mission_Command &cmd)
+{
+    plopter.next_WP_loc.alt = cmd.content.location.alt;
+    if (cmd.content.location.relative_alt) {
+        plopter.next_WP_loc.alt += plopter.home.alt;
+    }
+    plopter.next_WP_loc.relative_alt = false;
+    plopter.next_WP_loc.terrain_alt = cmd.content.location.terrain_alt;
+    plopter.reset_offset_altitude();
+}
+
+
+MAV_RESULT GCS_MAVLINK_Plopter::handle_command_preflight_calibration(const mavlink_command_long_t &packet)
+{
+    plopter.in_calibration = true;
+    MAV_RESULT ret = GCS_MAVLINK::handle_command_preflight_calibration(packet);
+    plopter.in_calibration = false;
+
+    return ret;
 }
 
 void GCS_MAVLINK_Plopter::packetReceived(const mavlink_status_t &status,
-                                        const mavlink_message_t &msg)
+                                       const mavlink_message_t &msg)
 {
 #if HAL_ADSB_ENABLED
-    if (plopter.g2.dev_options.get() & DevOptionADSBMAVLink) {
-        // optional handling of GLOBAL_POSITION_INT as a MAVLink based avoidance source
-        plopter.avoidance_adsb.handle_msg(msg);
-    }
+    plopter.avoidance_adsb.handle_msg(msg);
 #endif
-#if MODE_FOLLOW_ENABLED == ENABLED
+#if AP_SCRIPTING_ENABLED
     // pass message to follow library
     plopter.g2.follow.handle_msg(msg);
 #endif
     GCS_MAVLINK::packetReceived(status, msg);
 }
 
-bool GCS_MAVLINK_Plopter::params_ready() const
+
+bool GCS_MAVLINK_Plopter::set_home_to_current_location(bool _lock)
 {
-    if (AP_BoardConfig::in_config_error()) {
-        // we may never have parameters "initialised" in this case
-        return true;
+    if (!plopter.set_home_persistently(AP::gps().location())) {
+        return false;
     }
-    // if we have not yet initialised (including allocating the motors
-    // object) we drop this request. That prevents the GCS from getting
-    // a confusing parameter count during bootup
-    return plopter.ap.initialised_params;
-}
-
-void GCS_MAVLINK_Plopter::send_banner()
-{
-    GCS_MAVLINK::send_banner();
-    if (plopter.motors == nullptr) {
-        send_text(MAV_SEVERITY_INFO, "motors not allocated");
-        return;
+    if (_lock) {
+        AP::ahrs().lock_home();
     }
-    char frame_and_type_string[30];
-    plopter.motors->get_frame_and_type_string(frame_and_type_string, ARRAY_SIZE(frame_and_type_string));
-    send_text(MAV_SEVERITY_INFO, "%s", frame_and_type_string);
+    return true;
 }
-
-void GCS_MAVLINK_Plopter::handle_command_ack(const mavlink_message_t &msg)
+bool GCS_MAVLINK_Plopter::set_home(const Location& loc, bool _lock)
 {
-    plopter.command_ack_counter++;
-    GCS_MAVLINK::handle_command_ack(msg);
-}
-
-/*
-  handle a LANDING_TARGET command. The timestamp has been jitter corrected
-*/
-void GCS_MAVLINK_Plopter::handle_landing_target(const mavlink_landing_target_t &packet, uint32_t timestamp_ms)
-{
-#if PRECISION_LANDING == ENABLED
-    plopter.precland.handle_msg(packet, timestamp_ms);
-#endif
-}
-
-MAV_RESULT GCS_MAVLINK_Plopter::_handle_command_preflight_calibration(const mavlink_command_long_t &packet)
-{
-    if (is_equal(packet.param6,1.0f)) {
-        // compassmot calibration
-        return plopter.mavlink_compassmot(*this);
+    if (!AP::ahrs().set_home(loc)) {
+        return false;
     }
-
-    return GCS_MAVLINK::_handle_command_preflight_calibration(packet);
-}
-
-
-MAV_RESULT GCS_MAVLINK_Plopter::handle_command_do_set_roi(const Location &roi_loc)
-{
-    if (!roi_loc.check_latlng()) {
-        return MAV_RESULT_FAILED;
+    if (_lock) {
+        AP::ahrs().lock_home();
     }
-    plopter.flightmode->auto_yaw.set_roi(roi_loc);
-    return MAV_RESULT_ACCEPTED;
-}
-
-MAV_RESULT GCS_MAVLINK_Plopter::handle_preflight_reboot(const mavlink_command_long_t &packet)
-{
-    // reject reboot if user has also specified they want the "Auto" ESC calibration on next reboot
-    if (plopter.g.esc_calibrate == (uint8_t)Plopter::ESCCalibrationModes::ESCCAL_AUTO) {
-        send_text(MAV_SEVERITY_CRITICAL, "Reboot rejected, ESC cal on reboot");
-        return MAV_RESULT_FAILED;
-    }
-
-    // call parent
-    return GCS_MAVLINK::handle_preflight_reboot(packet);
-}
-
-bool GCS_MAVLINK_Plopter::set_home_to_current_location(bool _lock) {
-    return plopter.set_home_to_current_location(_lock);
-}
-bool GCS_MAVLINK_Plopter::set_home(const Location& loc, bool _lock) {
-    return plopter.set_home(loc, _lock);
+    return true;
 }
 
 MAV_RESULT GCS_MAVLINK_Plopter::handle_command_int_do_reposition(const mavlink_command_int_t &packet)
 {
-    const bool change_modes = ((int32_t)packet.param2 & MAV_DO_REPOSITION_FLAGS_CHANGE_MODE) == MAV_DO_REPOSITION_FLAGS_CHANGE_MODE;
-    if (!plopter.flightmode->in_guided_mode() && !change_modes) {
-        return MAV_RESULT_DENIED;
-    }
-
     // sanity check location
     if (!check_latlng(packet.x, packet.y)) {
         return MAV_RESULT_DENIED;
     }
 
-    Location request_location;
-    if (!location_from_command_t(packet, request_location)) {
+    Location requested_position;
+    if (!location_from_command_t(packet, requested_position)) {
         return MAV_RESULT_DENIED;
     }
 
-    if (request_location.sanitize(plopter.current_loc)) {
+    if (is_zero(packet.param4)) {
+        requested_position.loiter_ccw = 0;
+    } else {
+        requested_position.loiter_ccw = 1;
+    }
+
+    if (requested_position.sanitize(plopter.current_loc)) {
         // if the location wasn't already sane don't load it
-        return MAV_RESULT_DENIED; // failed as the location is not valid
+        return MAV_RESULT_DENIED;
     }
 
-    // we need to do this first, as we don't want to change the flight mode unless we can also set the target
-    if (!plopter.mode_guided.set_destination(request_location, false, 0, false, 0)) {
-        return MAV_RESULT_FAILED;
-    }
+    // location is valid load and set
+    if (((int32_t)packet.param2 & MAV_DO_REPOSITION_FLAGS_CHANGE_MODE) ||
+        (plopter.control_mode == &plopter.mode_guided)) {
+        plopter.set_mode(plopter.mode_guided, ModeReason::GCS_COMMAND);
 
-    if (!plopter.flightmode->in_guided_mode()) {
-        if (!plopter.set_mode(Mode::Number::GUIDED, ModeReason::GCS_COMMAND)) {
+        // add home alt if needed
+        if (requested_position.relative_alt) {
+            requested_position.alt += plopter.home.alt;
+            requested_position.relative_alt = 0;
+        }
+
+        plopter.set_guided_WP(requested_position);
+
+        return MAV_RESULT_ACCEPTED;
+    }
+    return MAV_RESULT_FAILED;
+}
+
+// these are GUIDED mode commands that are RATE or slew enabled, so you can have more powerful control than default controls.
+MAV_RESULT GCS_MAVLINK_Plopter::handle_command_int_guided_slew_commands(const mavlink_command_int_t &packet)
+{
+  switch(packet.command) {
+    
+#if OFFBOARD_GUIDED == ENABLED
+    case MAV_CMD_GUIDED_CHANGE_SPEED: {
+        // command is only valid in guided mode
+        if (plopter.control_mode != &plopter.mode_guided) {
             return MAV_RESULT_FAILED;
         }
-        // the position won't have been loaded if we had to change the flight mode, so load it again
-        if (!plopter.mode_guided.set_destination(request_location, false, 0, false, 0)) {
-            return MAV_RESULT_FAILED;
+
+         // only airspeed commands are supported right now...
+        if (int(packet.param1) != SPEED_TYPE_AIRSPEED) {  // since SPEED_TYPE is int in range 0-1 and packet.param1 is a *float* this works.
+            return MAV_RESULT_DENIED;
         }
+
+         // reject airspeeds that are outside of the tuning envelope
+        if (packet.param2 > plopter.aparm.airspeed_max || packet.param2 < plopter.aparm.airspeed_min) {
+            return MAV_RESULT_DENIED;
+        }
+
+         // no need to process any new packet/s with the
+         //  same airspeed any further, if we are already doing it.
+        float new_target_airspeed_cm = packet.param2 * 100;
+        if ( is_equal(new_target_airspeed_cm,plopter.guided_state.target_airspeed_cm)) {
+            return MAV_RESULT_ACCEPTED;
+        }
+        plopter.guided_state.target_airspeed_cm = new_target_airspeed_cm;
+        plopter.guided_state.target_airspeed_time_ms = AP_HAL::millis();
+
+         if (is_zero(packet.param3)) {
+            // the user wanted /maximum acceleration, pick a large value as close enough
+            plopter.guided_state.target_airspeed_accel = 1000.0f;
+        } else {
+            plopter.guided_state.target_airspeed_accel = fabsf(packet.param3);
+        }
+
+         // assign an acceleration direction
+        if (plopter.guided_state.target_airspeed_cm < plopter.target_airspeed_cm) {
+            plopter.guided_state.target_airspeed_accel *= -1.0f;
+        }
+        return MAV_RESULT_ACCEPTED;
     }
 
-    return MAV_RESULT_ACCEPTED;
+     case MAV_CMD_GUIDED_CHANGE_ALTITUDE: {
+        // command is only valid in guided
+        if (plopter.control_mode != &plopter.mode_guided) {
+            return MAV_RESULT_FAILED;
+        }
+
+        // disallow default value of -1 and dangerous value of zero
+        if (is_equal(packet.z, -1.0f) || is_equal(packet.z, 0.0f)){
+            return MAV_RESULT_DENIED;
+        }
+
+         // the requested alt data might be relative or absolute
+        float new_target_alt = packet.z * 100;
+        float new_target_alt_rel = packet.z * 100 + plopter.home.alt;
+
+         // only global/relative/terrain frames are supported
+        switch(packet.frame) {
+            case MAV_FRAME_GLOBAL_RELATIVE_ALT: {
+                if   (is_equal(plopter.guided_state.target_alt,new_target_alt_rel) ) { // compare two floats as near-enough
+                    // no need to process any new packet/s with the same ALT any further, if we are already doing it.
+                    return MAV_RESULT_ACCEPTED;
+                }
+                plopter.guided_state.target_alt = new_target_alt_rel;
+                break;
+            }
+            case MAV_FRAME_GLOBAL: {
+                if   (is_equal(plopter.guided_state.target_alt,new_target_alt) ) {  // compare two floats as near-enough
+                    // no need to process any new packet/s with the same ALT any further, if we are already doing it.
+                    return MAV_RESULT_ACCEPTED;
+                }
+                plopter.guided_state.target_alt = new_target_alt;
+                break;
+            }
+            default:
+                //  MAV_RESULT_DENIED  means Command is invalid (is supported but has invalid parameters).
+                return MAV_RESULT_DENIED;
+        }
+
+        plopter.guided_state.target_alt_frame = packet.frame;
+        plopter.guided_state.last_target_alt = plopter.current_loc.alt; // FIXME: Reference frame is not corrected for here
+        plopter.guided_state.target_alt_time_ms = AP_HAL::millis();
+
+        if (is_zero(packet.param3)) {
+            // the user wanted /maximum acceleration, pick a large value as close enough
+            plopter.guided_state.target_alt_accel = 1000.0;
+        } else {
+            plopter.guided_state.target_alt_accel = fabsf(packet.param3);
+        }
+
+         // assign an acceleration direction
+        if (plopter.guided_state.target_alt < plopter.current_loc.alt) {
+            plopter.guided_state.target_alt_accel *= -1.0f;
+        }
+        return MAV_RESULT_ACCEPTED;
+    }
+
+     case MAV_CMD_GUIDED_CHANGE_HEADING: {
+
+        // command is only valid in guided mode
+        if (plopter.control_mode != &plopter.mode_guided) {
+            return MAV_RESULT_FAILED;
+        }
+
+         // don't accept packets outside of [0-360] degree range
+        if (packet.param2 < 0.0f || packet.param2 >= 360.0f) {
+            return MAV_RESULT_DENIED;
+        }
+
+        float new_target_heading = radians(wrap_180(packet.param2));
+
+        // if packet is requesting us to go to the heading we are already going to, we-re already on it.
+        if ( (is_equal(new_target_heading,plopter.guided_state.target_heading))) { // compare two floats as near-enough
+            return MAV_RESULT_ACCEPTED;
+        }
+
+        // course over ground
+        if ( int(packet.param1) == HEADING_TYPE_COURSE_OVER_GROUND) { // compare as nearest int
+            plopter.guided_state.target_heading_type = GUIDED_HEADING_COG;
+            plopter.prev_WP_loc = plopter.current_loc;
+        // normal vehicle heading
+        } else if (int(packet.param1) == HEADING_TYPE_HEADING) { // compare as nearest int
+            plopter.guided_state.target_heading_type = GUIDED_HEADING_HEADING;
+        } else {
+            //  MAV_RESULT_DENIED  means Command is invalid (is supported but has invalid parameters).
+            return MAV_RESULT_DENIED;
+        }
+
+        plopter.g2.guidedHeading.reset_I();
+
+        plopter.guided_state.target_heading = new_target_heading;
+        plopter.guided_state.target_heading_accel_limit = MAX(packet.param3, 0.05f);
+        plopter.guided_state.target_heading_time_ms = AP_HAL::millis();
+        return MAV_RESULT_ACCEPTED;
+    }
+#endif // OFFBOARD_GUIDED == ENABLED
+
+
+  }
+  // anything else ...
+  return MAV_RESULT_UNSUPPORTED;
+
 }
 
 MAV_RESULT GCS_MAVLINK_Plopter::handle_command_int_packet(const mavlink_command_int_t &packet)
 {
+
+    plopter.Log_Write_MavCmdI(packet);
+
     switch(packet.command) {
-        case MAV_CMD_DO_FOLLOW:
-#if MODE_FOLLOW_ENABLED == ENABLED
-            // param1: sysid of target to follow
-            if ((packet.param1 > 0) && (packet.param1 <= 255)) {
-                plopter.g2.follow.set_target_sysid((uint8_t)packet.param1);
-                return MAV_RESULT_ACCEPTED;
-            }
-#endif
-            return MAV_RESULT_UNSUPPORTED;
 
-        case MAV_CMD_DO_REPOSITION:
-            return handle_command_int_do_reposition(packet);
+    case MAV_CMD_DO_REPOSITION:
+        return handle_command_int_do_reposition(packet);
 
-            // pause or resume an auto mission
-        case MAV_CMD_DO_PAUSE_CONTINUE:
-            return handle_command_pause_continue(packet);
+    // special 'slew-enabled' guided commands here... for speed,alt, and direction commands
+    case MAV_CMD_GUIDED_CHANGE_SPEED:
+    case MAV_CMD_GUIDED_CHANGE_ALTITUDE:
+    case MAV_CMD_GUIDED_CHANGE_HEADING:
+        return handle_command_int_guided_slew_commands(packet);
 
-        default:
-            return GCS_MAVLINK::handle_command_int_packet(packet);
-    }
-}
-
-MAV_RESULT GCS_MAVLINK_Plopter::handle_command_mount(const mavlink_command_long_t &packet)
-{
-    switch (packet.command) {
-#if HAL_MOUNT_ENABLED
-        case MAV_CMD_DO_MOUNT_CONTROL:
-        // if vehicle has a camera mount but it doesn't do pan control then yaw the entire vehicle instead
-        if ((plopter.camera_mount.get_mount_type() != plopter.camera_mount.MountType::Mount_Type_None) &&
-            !plopter.camera_mount.has_pan_control()) {
-            plopter.flightmode->auto_yaw.set_yaw_angle_rate(
-                (float)packet.param3 * 0.01f,
-                0.0f);
+    case MAV_CMD_DO_FOLLOW:
+#if AP_SCRIPTING_ENABLED
+        // param1: sysid of target to follow
+        if ((packet.param1 > 0) && (packet.param1 <= 255)) {
+            plopter.g2.follow.set_target_sysid((uint8_t)packet.param1);
+            return MAV_RESULT_ACCEPTED;
         }
-        break;
 #endif
-        default:
-            break;
+        return MAV_RESULT_FAILED;
+        
+    default:
+        return GCS_MAVLINK::handle_command_int_packet(packet);
     }
-    return GCS_MAVLINK::handle_command_mount(packet);
 }
 
 MAV_RESULT GCS_MAVLINK_Plopter::handle_command_long_packet(const mavlink_command_long_t &packet)
 {
     switch(packet.command) {
 
-        case MAV_CMD_NAV_VTOL_TAKEOFF:
-        case MAV_CMD_NAV_TAKEOFF: {
-            // param3 : horizontal navigation by pilot acceptable
-            // param4 : yaw angle   (not supported)
-            // param5 : latitude    (not supported)
-            // param6 : longitude   (not supported)
-            // param7 : altitude [metres]
-
-            float takeoff_alt = packet.param7 * 100;      // Convert m to cm
-
-            if (!plopter.flightmode->do_user_takeoff(takeoff_alt, is_zero(packet.param3))) {
-                return MAV_RESULT_FAILED;
-            }
-            return MAV_RESULT_ACCEPTED;
-        }
-
-#if MODE_AUTO_ENABLED == ENABLED
-        case MAV_CMD_DO_LAND_START:
-            if (plopter.mode_auto.jump_to_landing_sequence_auto_RTL(ModeReason::GCS_COMMAND)) {
-                return MAV_RESULT_ACCEPTED;
-            }
-            return MAV_RESULT_FAILED;
-#endif
-
-        case MAV_CMD_NAV_LOITER_UNLIM:
-            if (!plopter.set_mode(Mode::Number::LOITER, ModeReason::GCS_COMMAND)) {
-                return MAV_RESULT_FAILED;
-            }
-            return MAV_RESULT_ACCEPTED;
-
-        case MAV_CMD_NAV_RETURN_TO_LAUNCH:
-            if (!plopter.set_mode(Mode::Number::RTL, ModeReason::GCS_COMMAND)) {
-                return MAV_RESULT_FAILED;
-            }
-            return MAV_RESULT_ACCEPTED;
-
-        case MAV_CMD_NAV_VTOL_LAND:
-        case MAV_CMD_NAV_LAND:
-            if (!plopter.set_mode(Mode::Number::LAND, ModeReason::GCS_COMMAND)) {
-                return MAV_RESULT_FAILED;
-            }
-            return MAV_RESULT_ACCEPTED;
-
-#if MODE_FOLLOW_ENABLED == ENABLED
-        case MAV_CMD_DO_FOLLOW:
-            // param1: sysid of target to follow
-            if ((packet.param1 > 0) && (packet.param1 <= 255)) {
-                plopter.g2.follow.set_target_sysid((uint8_t)packet.param1);
-                return MAV_RESULT_ACCEPTED;
-            }
-            return MAV_RESULT_FAILED;
-#endif
-
-        case MAV_CMD_CONDITION_YAW:
-            // param1 : target angle [0-360]
-            // param2 : speed during change [deg per second]
-            // param3 : direction (-1:ccw, +1:cw)
-            // param4 : relative offset (1) or absolute angle (0)
-            if ((packet.param1 >= 0.0f)   &&
-                (packet.param1 <= 360.0f) &&
-                (is_zero(packet.param4) || is_equal(packet.param4,1.0f))) {
-                plopter.flightmode->auto_yaw.set_fixed_yaw(
-                        packet.param1,
-                        packet.param2,
-                        (int8_t)packet.param3,
-                        is_positive(packet.param4));
-                return MAV_RESULT_ACCEPTED;
-            }
-            return MAV_RESULT_FAILED;
-
-        case MAV_CMD_DO_CHANGE_SPEED:
-            // param1 : Speed type (0 or 1=Ground Speed, 2=Climb Speed, 3=Descent Speed)
-            // param2 : new speed in m/s
-            // param3 : unused
-            // param4 : unused
-            if (packet.param2 > 0.0f) {
-                if (packet.param1 > 2.9f) { // 3 = speed down
-                    plopter.wp_nav->set_speed_down(packet.param2 * 100.0f);
-                } else if (packet.param1 > 1.9f) { // 2 = speed up
-                    plopter.wp_nav->set_speed_up(packet.param2 * 100.0f);
-                } else {
-                    plopter.wp_nav->set_speed_xy(packet.param2 * 100.0f);
-                }
-                return MAV_RESULT_ACCEPTED;
-            }
-            return MAV_RESULT_FAILED;
-
-#if MODE_AUTO_ENABLED == ENABLED
-        case MAV_CMD_MISSION_START:
-            if (plopter.set_mode(Mode::Number::AUTO, ModeReason::GCS_COMMAND)) {
-                plopter.set_auto_armed(true);
-                if (plopter.mode_auto.mission.state() != AP_Mission::MISSION_RUNNING) {
-                    plopter.mode_auto.mission.start_or_resume();
-                }
-                return MAV_RESULT_ACCEPTED;
-            }
-            return MAV_RESULT_FAILED;
-#endif
-
-#if PARACHUTE == ENABLED
-        case MAV_CMD_DO_PARACHUTE:
-            // configure or release parachute
-            switch ((uint16_t)packet.param1) {
-                case PARACHUTE_DISABLE:
-                    plopter.parachute.enabled(false);
-                    return MAV_RESULT_ACCEPTED;
-                case PARACHUTE_ENABLE:
-                    plopter.parachute.enabled(true);
-                    return MAV_RESULT_ACCEPTED;
-                case PARACHUTE_RELEASE:
-                    // treat as a manual release which performs some additional check of altitude
-                    plopter.parachute_manual_release();
-                    return MAV_RESULT_ACCEPTED;
-            }
-            return MAV_RESULT_FAILED;
-#endif
-
-        case MAV_CMD_DO_MOTOR_TEST:
-            // param1 : motor sequence number (a number from 1 to max number of motors on the vehicle)
-            // param2 : throttle type (0=throttle percentage, 1=PWM, 2=pilot throttle channel pass-through. See MOTOR_TEST_THROTTLE_TYPE enum)
-            // param3 : throttle (range depends upon param2)
-            // param4 : timeout (in seconds)
-            // param5 : num_motors (in sequence)
-            // param6 : motor test order
-            return plopter.mavlink_motor_test_start(*this,
-                                                   (uint8_t)packet.param1,
-                                                   (uint8_t)packet.param2,
-                                                   packet.param3,
-                                                   packet.param4,
-                                                   (uint8_t)packet.param5);
-
-#if WINCH_ENABLED == ENABLED
-        case MAV_CMD_DO_WINCH:
-            // param1 : winch number (ignored)
-            // param2 : action (0=relax, 1=relative length control, 2=rate control). See WINCH_ACTIONS enum.
-            if (!plopter.g2.winch.enabled()) {
-                return MAV_RESULT_FAILED;
-            }
-            switch ((uint8_t)packet.param2) {
-                case WINCH_RELAXED:
-                    plopter.g2.winch.relax();
-                    return MAV_RESULT_ACCEPTED;
-                case WINCH_RELATIVE_LENGTH_CONTROL: {
-                    plopter.g2.winch.release_length(packet.param3);
-                    return MAV_RESULT_ACCEPTED;
-                }
-                case WINCH_RATE_CONTROL:
-                    plopter.g2.winch.set_desired_rate(packet.param4);
-                    return MAV_RESULT_ACCEPTED;
-                default:
-                    break;
-            }
-            return MAV_RESULT_FAILED;
-#endif
-
-#if LANDING_GEAR_ENABLED == ENABLED
-        case MAV_CMD_AIRFRAME_CONFIGURATION: {
-            // Param 1: Select which gear, not used in ArduPilot
-            // Param 2: 0 = Deploy, 1 = Retract
-            // For safety, anything other than 1 will deploy
-            switch ((uint8_t)packet.param2) {
-                case 1:
-                    plopter.landinggear.set_position(AP_LandingGear::LandingGear_Retract);
-                    return MAV_RESULT_ACCEPTED;
-                default:
-                    plopter.landinggear.set_position(AP_LandingGear::LandingGear_Deploy);
-                    return MAV_RESULT_ACCEPTED;
-            }
+    case MAV_CMD_DO_CHANGE_SPEED: {
+        // if we're in failsafe modes (e.g., RTL, LOITER) or in pilot
+        // controlled modes (e.g., MANUAL, TRAINING)
+        // this command should be ignored since it comes in from GCS
+        // or a companion computer:
+        if ((!plopter.control_mode->is_guided_mode()) &&
+            (plopter.control_mode != &plopter.mode_auto)) {
+            // failed
             return MAV_RESULT_FAILED;
         }
-#endif
 
-            /* Solo user presses Fly button */
-        case MAV_CMD_SOLO_BTN_FLY_CLICK: {
-            if (plopter.failsafe.radio) {
-                return MAV_RESULT_ACCEPTED;
-            }
-
-            // set mode to Loiter or fall back to AltHold
-            if (!plopter.set_mode(Mode::Number::LOITER, ModeReason::GCS_COMMAND)) {
-                plopter.set_mode(Mode::Number::ALT_HOLD, ModeReason::GCS_COMMAND);
-            }
+        AP_Mission::Mission_Command cmd;
+        if (AP_Mission::mavlink_cmd_long_to_mission_cmd(packet, cmd) != MAV_MISSION_ACCEPTED) {
+            return MAV_RESULT_DENIED;
+        }
+        if (plopter.do_change_speed(cmd)) {
             return MAV_RESULT_ACCEPTED;
         }
+        return MAV_RESULT_FAILED;
+    }
 
-            /* Solo user holds down Fly button for a couple of seconds */
-        case MAV_CMD_SOLO_BTN_FLY_HOLD: {
-            if (plopter.failsafe.radio) {
-                return MAV_RESULT_ACCEPTED;
-            }
+    case MAV_CMD_NAV_LOITER_UNLIM:
+        plopter.set_mode(plopter.mode_loiter, ModeReason::GCS_COMMAND);
+        return MAV_RESULT_ACCEPTED;
 
-            if (!plopter.motors->armed()) {
-                // if disarmed, arm motors
-                plopter.arming.arm(AP_Arming::Method::MAVLINK);
-            } else if (plopter.ap.land_complete) {
-                // if armed and landed, takeoff
-                if (plopter.set_mode(Mode::Number::LOITER, ModeReason::GCS_COMMAND)) {
-                    plopter.flightmode->do_user_takeoff(packet.param1*100, true);
+    case MAV_CMD_NAV_RETURN_TO_LAUNCH:
+        plopter.set_mode(plopter.mode_rtl, ModeReason::GCS_COMMAND);
+        return MAV_RESULT_ACCEPTED;
+
+#if HAL_QUADPLANE_ENABLED
+    case MAV_CMD_NAV_TAKEOFF: {
+        // user takeoff only works with quadplopter code for now
+        // param7 : altitude [metres]
+        float takeoff_alt = packet.param7;
+        if (plopter.quadplopter.available() && plopter.quadplopter.do_user_takeoff(takeoff_alt)) {
+            return MAV_RESULT_ACCEPTED;
+        }
+        return MAV_RESULT_FAILED;
+    }
+#endif  // HAL_QUADPLANE_ENABLED
+
+    case MAV_CMD_MISSION_START:
+        plopter.set_mode(plopter.mode_auto, ModeReason::GCS_COMMAND);
+        return MAV_RESULT_ACCEPTED;
+
+    case MAV_CMD_DO_LAND_START:
+        // attempt to switch to next DO_LAND_START command in the mission
+        if (plopter.mission.jump_to_landing_sequence()) {
+            plopter.set_mode(plopter.mode_auto, ModeReason::GCS_COMMAND);
+            return MAV_RESULT_ACCEPTED;
+        }
+        return MAV_RESULT_FAILED;
+
+    case MAV_CMD_DO_GO_AROUND:
+        {
+            uint16_t mission_id = plopter.mission.get_current_nav_cmd().id;
+            bool is_in_landing = (plopter.flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND) ||
+                                 (mission_id == MAV_CMD_NAV_LAND) ||
+                                 (mission_id == MAV_CMD_NAV_VTOL_LAND);
+            if (is_in_landing) {
+                // fly a user planned abort pattern if available
+                if (plopter.mission.jump_to_abort_landing_sequence()) {
+                    return MAV_RESULT_ACCEPTED;
                 }
-            } else {
-                // if flying, land
-                plopter.set_mode(Mode::Number::LAND, ModeReason::GCS_COMMAND);
-            }
-            return MAV_RESULT_ACCEPTED;
-        }
 
-            /* Solo user presses pause button */
-        case MAV_CMD_SOLO_BTN_PAUSE_CLICK: {
-            if (plopter.failsafe.radio) {
-                return MAV_RESULT_ACCEPTED;
-            }
-
-            if (plopter.motors->armed()) {
-                if (plopter.ap.land_complete) {
-                    // if landed, disarm motors
-                    plopter.arming.disarm(AP_Arming::Method::SOLOPAUSEWHENLANDED);
-                } else {
-                    // assume that shots modes are all done in guided.
-                    // NOTE: this may need to change if we add a non-guided shot mode
-                    bool shot_mode = (!is_zero(packet.param1) && (plopter.flightmode->mode_number() == Mode::Number::GUIDED || plopter.flightmode->mode_number() == Mode::Number::GUIDED_NOGPS));
-
-                    if (!shot_mode) {
-#if MODE_BRAKE_ENABLED == ENABLED
-                        if (plopter.set_mode(Mode::Number::BRAKE, ModeReason::GCS_COMMAND)) {
-                            plopter.mode_brake.timeout_to_loiter_ms(2500);
-                        } else {
-                            plopter.set_mode(Mode::Number::ALT_HOLD, ModeReason::GCS_COMMAND);
-                        }
+                // only fly a fixed wing abort if we aren't doing quadplopter stuff, or potentially
+                // shooting a quadplopter approach
+#if HAL_QUADPLANE_ENABLED
+                const bool attempt_go_around =
+                    (!plopter.quadplopter.available()) ||
+                    ((!plopter.quadplopter.in_vtol_auto()) &&
+                     (!(plopter.quadplopter.options & QuadPlopter::OPTION_MISSION_LAND_FW_APPROACH)));
 #else
-                        plopter.set_mode(Mode::Number::ALT_HOLD, ModeReason::GCS_COMMAND);
+                const bool attempt_go_around = true;
 #endif
-                    } else {
-                        // SoloLink is expected to handle pause in shots
+                if (attempt_go_around) {
+                    // Initiate an aborted landing. This will trigger a pitch-up and
+                    // climb-out to a safe altitude holding heading then one of the
+                    // following actions will occur, check for in this order:
+                    // - If MAV_CMD_CONTINUE_AND_CHANGE_ALT is next command in mission,
+                    //      increment mission index to execute it
+                    // - else if DO_LAND_START is available, jump to it
+                    // - else decrement the mission index to repeat the landing approach
+
+                    if (!is_zero(packet.param1)) {
+                        plopter.auto_state.takeoff_altitude_rel_cm = packet.param1 * 100;
+                    }
+                    if (plopter.landing.request_go_around()) {
+                        plopter.auto_state.next_wp_crosstrack = false;
+                        return MAV_RESULT_ACCEPTED;
                     }
                 }
             }
-            return MAV_RESULT_ACCEPTED;
         }
+        return MAV_RESULT_FAILED;
 
-            // pause or resume an auto mission
-        case MAV_CMD_DO_PAUSE_CONTINUE: {
-            mavlink_command_int_t packet_int;
-            GCS_MAVLINK_Plopter::convert_COMMAND_LONG_to_COMMAND_INT(packet, packet_int);
-            return handle_command_pause_continue(packet_int);
+    case MAV_CMD_DO_SET_HOME: {
+        // param1 : use current (1=use current location, 0=use specified location)
+        // param5 : latitude
+        // param6 : longitude
+        // param7 : altitude (absolute)
+        if (is_equal(packet.param1,1.0f)) {
+            if (!plopter.set_home_persistently(AP::gps().location())) {
+                return MAV_RESULT_FAILED;
+            }
+            AP::ahrs().lock_home();
+        } else {
+            // ensure param1 is zero
+            if (!is_zero(packet.param1)) {
+                return MAV_RESULT_FAILED;
+            }
+            Location new_home_loc;
+            if (!location_from_command_t(packet, MAV_FRAME_GLOBAL, new_home_loc)) {
+                return MAV_RESULT_DENIED;
+            }
+            if (!set_home(new_home_loc, true)) {
+                return MAV_RESULT_FAILED;
+            }
         }
+        if ((plopter.control_mode == &plopter.mode_rtl)
+#if HAL_QUADPLANE_ENABLED
+                || (plopter.control_mode == &plopter.mode_qrtl)
+#endif
+                                                            ) {
+            // if in RTL head to the updated home location
+            plopter.control_mode->enter();
+        }
+        return MAV_RESULT_ACCEPTED;
+    }
+
+    case MAV_CMD_DO_AUTOTUNE_ENABLE:
+        // param1 : enable/disable
+        plopter.autotune_enable(!is_zero(packet.param1));
+        return MAV_RESULT_ACCEPTED;
+
+#if PARACHUTE == ENABLED
+    case MAV_CMD_DO_PARACHUTE:
+        // configure or release parachute
+        switch ((uint16_t)packet.param1) {
+        case PARACHUTE_DISABLE:
+            plopter.parachute.enabled(false);
+            return MAV_RESULT_ACCEPTED;
+        case PARACHUTE_ENABLE:
+            plopter.parachute.enabled(true);
+            return MAV_RESULT_ACCEPTED;
+        case PARACHUTE_RELEASE:
+            // treat as a manual release which performs some additional check of altitude
+            if (plopter.parachute.released()) {
+                gcs().send_text(MAV_SEVERITY_NOTICE, "Parachute already released");
+                return MAV_RESULT_FAILED;
+            }
+            if (!plopter.parachute.enabled()) {
+                gcs().send_text(MAV_SEVERITY_NOTICE, "Parachute not enabled");
+                return MAV_RESULT_FAILED;
+            }
+            if (!plopter.parachute_manual_release()) {
+                return MAV_RESULT_FAILED;
+            }
+            return MAV_RESULT_ACCEPTED;
         default:
-            return GCS_MAVLINK::handle_command_long_packet(packet);
-    }
-}
-
-MAV_RESULT GCS_MAVLINK_Plopter::handle_command_pause_continue(const mavlink_command_int_t &packet)
-{
-    // requested pause
-    if ((uint8_t) packet.param1 == 0) {
-        if (plopter.flightmode->pause()) {
-            return MAV_RESULT_ACCEPTED;
-        }
-        send_text(MAV_SEVERITY_INFO, "Failed to pause");
-        return MAV_RESULT_FAILED;
-    }
-
-    // requested resume
-    if ((uint8_t) packet.param1 == 1) {
-        if (plopter.flightmode->resume()) {
-            return MAV_RESULT_ACCEPTED;
-        }
-        send_text(MAV_SEVERITY_INFO, "Failed to resume");
-        return MAV_RESULT_FAILED;
-    }
-    return MAV_RESULT_DENIED;
-}
-
-void GCS_MAVLINK_Plopter::handle_mount_message(const mavlink_message_t &msg)
-{
-    switch (msg.msgid) {
-#if HAL_MOUNT_ENABLED
-        case MAVLINK_MSG_ID_MOUNT_CONTROL:
-        // if vehicle has a camera mount but it doesn't do pan control then yaw the entire vehicle instead
-        if ((plopter.camera_mount.get_mount_type() != plopter.camera_mount.MountType::Mount_Type_None) &&
-            !plopter.camera_mount.has_pan_control()) {
-            plopter.flightmode->auto_yaw.set_yaw_angle_rate(
-                mavlink_msg_mount_control_get_input_c(&msg) * 0.01f,
-                0.0f);
-
             break;
         }
+        return MAV_RESULT_FAILED;
 #endif
+
+#if HAL_QUADPLANE_ENABLED
+    case MAV_CMD_DO_MOTOR_TEST:
+        // param1 : motor sequence number (a number from 1 to max number of motors on the vehicle)
+        // param2 : throttle type (0=throttle percentage, 1=PWM, 2=pilot throttle channel pass-through. See MOTOR_TEST_THROTTLE_TYPE enum)
+        // param3 : throttle (range depends upon param2)
+        // param4 : timeout (in seconds)
+        // param5 : motor count (number of motors to test in sequence)
+        return plopter.quadplopter.mavlink_motor_test_start(chan,
+                                                        (uint8_t)packet.param1,
+                                                        (uint8_t)packet.param2,
+                                                        (uint16_t)packet.param3,
+                                                        packet.param4,
+                                                        (uint8_t)packet.param5);
+
+    case MAV_CMD_DO_VTOL_TRANSITION:
+        if (!plopter.quadplopter.handle_do_vtol_transition((enum MAV_VTOL_STATE)packet.param1)) {
+            return MAV_RESULT_FAILED;
+        }
+        return MAV_RESULT_ACCEPTED;
+#endif
+
+    case MAV_CMD_DO_ENGINE_CONTROL:
+        if (!plopter.g2.ice_control.engine_control(packet.param1, packet.param2, packet.param3)) {
+            return MAV_RESULT_FAILED;
+        }
+        return MAV_RESULT_ACCEPTED;
+
+#if AP_SCRIPTING_ENABLED
+    case MAV_CMD_DO_FOLLOW:
+        // param1: sysid of target to follow
+        if ((packet.param1 > 0) && (packet.param1 <= 255)) {
+            plopter.g2.follow.set_target_sysid((uint8_t)packet.param1);
+            return MAV_RESULT_ACCEPTED;
+        }
+        return MAV_RESULT_FAILED;
+#endif
+        
+    default:
+        return GCS_MAVLINK::handle_command_long_packet(packet);
     }
-    GCS_MAVLINK::handle_mount_message(msg);
 }
 
 void GCS_MAVLINK_Plopter::handleMessage(const mavlink_message_t &msg)
 {
-    // for mavlink SET_POSITION_TARGET messages
-    constexpr uint32_t MAVLINK_SET_POS_TYPE_MASK_POS_IGNORE =
-            POSITION_TARGET_TYPEMASK_X_IGNORE |
-            POSITION_TARGET_TYPEMASK_Y_IGNORE |
-            POSITION_TARGET_TYPEMASK_Z_IGNORE;
-
-    constexpr uint32_t MAVLINK_SET_POS_TYPE_MASK_VEL_IGNORE =
-            POSITION_TARGET_TYPEMASK_VX_IGNORE |
-            POSITION_TARGET_TYPEMASK_VY_IGNORE |
-            POSITION_TARGET_TYPEMASK_VZ_IGNORE;
-
-    constexpr uint32_t MAVLINK_SET_POS_TYPE_MASK_ACC_IGNORE =
-            POSITION_TARGET_TYPEMASK_AX_IGNORE |
-            POSITION_TARGET_TYPEMASK_AY_IGNORE |
-            POSITION_TARGET_TYPEMASK_AZ_IGNORE;
-
-    constexpr uint32_t MAVLINK_SET_POS_TYPE_MASK_YAW_IGNORE =
-            POSITION_TARGET_TYPEMASK_YAW_IGNORE;
-    constexpr uint32_t MAVLINK_SET_POS_TYPE_MASK_YAW_RATE_IGNORE =
-            POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE;
-    constexpr uint32_t MAVLINK_SET_POS_TYPE_MASK_FORCE_SET =
-            POSITION_TARGET_TYPEMASK_FORCE_SET;
-
     switch (msg.msgid) {
 
-        case MAVLINK_MSG_ID_MANUAL_CONTROL:
-        {
-            if (msg.sysid != plopter.g.sysid_my_gcs) {
-                break; // only accept control from our gcs
-            }
-
-            mavlink_manual_control_t packet;
-            mavlink_msg_manual_control_decode(&msg, &packet);
-
-            if (packet.target != plopter.g.sysid_this_mav) {
-                break; // only accept control aimed at us
-            }
-
-            if (packet.z < 0) { // Plopter doesn't do negative thrust
-                break;
-            }
-
-            uint32_t tnow = AP_HAL::millis();
-
-            manual_override(plopter.channel_roll, packet.y, 1000, 2000, tnow);
-            manual_override(plopter.channel_pitch, packet.x, 1000, 2000, tnow, true);
-            manual_override(plopter.channel_throttle, packet.z, 0, 1000, tnow);
-            manual_override(plopter.channel_yaw, packet.r, 1000, 2000, tnow);
-
-            // a manual control message is considered to be a 'heartbeat'
-            // from the ground station for failsafe purposes
-            gcs().sysid_myggcs_seen(tnow);
-            break;
+    case MAVLINK_MSG_ID_MANUAL_CONTROL:
+    {
+        if (msg.sysid != plopter.g.sysid_my_gcs) {
+            break; // only accept control from our gcs
         }
 
-#if MODE_GUIDED_ENABLED == ENABLED
-        case MAVLINK_MSG_ID_SET_ATTITUDE_TARGET:   // MAV ID: 82
-        {
-            // decode packet
-            mavlink_set_attitude_target_t packet;
-            mavlink_msg_set_attitude_target_decode(&msg, &packet);
+        mavlink_manual_control_t packet;
+        mavlink_msg_manual_control_decode(&msg, &packet);
 
-            // exit if vehicle is not in Guided mode or Auto-Guided mode
-            if (!plopter.flightmode->in_guided_mode()) {
-                break;
-            }
-
-            const bool roll_rate_ignore   = packet.type_mask & ATTITUDE_TARGET_TYPEMASK_BODY_ROLL_RATE_IGNORE;
-            const bool pitch_rate_ignore  = packet.type_mask & ATTITUDE_TARGET_TYPEMASK_BODY_PITCH_RATE_IGNORE;
-            const bool yaw_rate_ignore    = packet.type_mask & ATTITUDE_TARGET_TYPEMASK_BODY_YAW_RATE_IGNORE;
-            const bool throttle_ignore    = packet.type_mask & ATTITUDE_TARGET_TYPEMASK_THROTTLE_IGNORE;
-            const bool attitude_ignore    = packet.type_mask & ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE;
-
-            // ensure thrust field is not ignored
-            if (throttle_ignore) {
-                break;
-            }
-
-            Quaternion attitude_quat;
-            if (attitude_ignore) {
-                attitude_quat.zero();
-            } else {
-                attitude_quat = Quaternion(packet.q[0],packet.q[1],packet.q[2],packet.q[3]);
-
-                // Do not accept the attitude_quaternion
-                // if its magnitude is not close to unit length +/- 1E-3
-                // this limit is somewhat greater than sqrt(FLT_EPSL)
-                if (!attitude_quat.is_unit_length()) {
-                    // The attitude quaternion is ill-defined
-                    break;
-                }
-            }
-
-            // check if the message's thrust field should be interpreted as a climb rate or as thrust
-            const bool use_thrust = plopter.mode_guided.set_attitude_target_provides_thrust();
-
-            float climb_rate_or_thrust;
-            if (use_thrust) {
-                // interpret thrust as thrust
-                climb_rate_or_thrust = constrain_float(packet.thrust, -1.0f, 1.0f);
-            } else {
-                // convert thrust to climb rate
-                packet.thrust = constrain_float(packet.thrust, 0.0f, 1.0f);
-                if (is_equal(packet.thrust, 0.5f)) {
-                    climb_rate_or_thrust = 0.0f;
-                } else if (packet.thrust > 0.5f) {
-                    // climb at up to WPNAV_SPEED_UP
-                    climb_rate_or_thrust = (packet.thrust - 0.5f) * 2.0f * plopter.wp_nav->get_default_speed_up();
-                } else {
-                    // descend at up to WPNAV_SPEED_DN
-                    climb_rate_or_thrust = (0.5f - packet.thrust) * 2.0f * -plopter.wp_nav->get_default_speed_down();
-                }
-            }
-
-            Vector3f ang_vel;
-            if (!roll_rate_ignore) {
-                ang_vel.x = packet.body_roll_rate;
-            }
-            if (!pitch_rate_ignore) {
-                ang_vel.y = packet.body_pitch_rate;
-            }
-            if (!yaw_rate_ignore) {
-                ang_vel.z = packet.body_yaw_rate;
-            }
-
-            plopter.mode_guided.set_angle(attitude_quat, ang_vel,
-                                         climb_rate_or_thrust, use_thrust);
-
-            break;
+        if (packet.target != plopter.g.sysid_this_mav) {
+            break; // only accept messages aimed at us
         }
 
-        case MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED:     // MAV ID: 84
-        {
-            // decode packet
-            mavlink_set_position_target_local_ned_t packet;
-            mavlink_msg_set_position_target_local_ned_decode(&msg, &packet);
+        uint32_t tnow = AP_HAL::millis();
 
-            // exit if vehicle is not in Guided mode or Auto-Guided mode
-            if (!plopter.flightmode->in_guided_mode()) {
-                break;
-            }
+        manual_override(plopter.channel_roll, packet.y, 1000, 2000, tnow);
+        manual_override(plopter.channel_pitch, packet.x, 1000, 2000, tnow, true);
+        manual_override(plopter.channel_throttle, packet.z, 0, 1000, tnow);
+        manual_override(plopter.channel_rudder, packet.r, 1000, 2000, tnow);
 
-            // check for supported coordinate frames
-            if (packet.coordinate_frame != MAV_FRAME_LOCAL_NED &&
-                packet.coordinate_frame != MAV_FRAME_LOCAL_OFFSET_NED &&
-                packet.coordinate_frame != MAV_FRAME_BODY_NED &&
-                packet.coordinate_frame != MAV_FRAME_BODY_OFFSET_NED) {
-                // input is not valid so stop
-                plopter.mode_guided.init(true);
-                break;
-            }
+        // a manual control message is considered to be a 'heartbeat'
+        // from the ground station for failsafe purposes
+        gcs().sysid_myggcs_seen(tnow);
+        break;
+    }
 
-            bool pos_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_POS_IGNORE;
-            bool vel_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_VEL_IGNORE;
-            bool acc_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_ACC_IGNORE;
-            bool yaw_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_YAW_IGNORE;
-            bool yaw_rate_ignore = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_YAW_RATE_IGNORE;
-            bool force_set       = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_FORCE_SET;
+    case MAVLINK_MSG_ID_RADIO:
+    case MAVLINK_MSG_ID_RADIO_STATUS:
+    {
+        handle_radio_status(msg, plopter.should_log(MASK_LOG_PM));
+        break;
+    }
 
-            // Force inputs are not supported
-            // Do not accept command if force_set is true and acc_ignore is false
-            if (force_set && !acc_ignore) {
-                break;
-            }
-
-            // prepare position
-            Vector3f pos_vector;
-            if (!pos_ignore) {
-                // convert to cm
-                pos_vector = Vector3f(packet.x * 100.0f, packet.y * 100.0f, -packet.z * 100.0f);
-                // rotate to body-frame if necessary
-                if (packet.coordinate_frame == MAV_FRAME_BODY_NED ||
-                    packet.coordinate_frame == MAV_FRAME_BODY_OFFSET_NED) {
-                    plopter.rotate_body_frame_to_NE(pos_vector.x, pos_vector.y);
-                }
-                // add body offset if necessary
-                if (packet.coordinate_frame == MAV_FRAME_LOCAL_OFFSET_NED ||
-                    packet.coordinate_frame == MAV_FRAME_BODY_NED ||
-                    packet.coordinate_frame == MAV_FRAME_BODY_OFFSET_NED) {
-                    pos_vector += plopter.inertial_nav.get_position_neu_cm();
-                }
-            }
-
-            // prepare velocity
-            Vector3f vel_vector;
-            if (!vel_ignore) {
-                // convert to cm
-                vel_vector = Vector3f(packet.vx * 100.0f, packet.vy * 100.0f, -packet.vz * 100.0f);
-                // rotate to body-frame if necessary
-                if (packet.coordinate_frame == MAV_FRAME_BODY_NED || packet.coordinate_frame == MAV_FRAME_BODY_OFFSET_NED) {
-                    plopter.rotate_body_frame_to_NE(vel_vector.x, vel_vector.y);
-                }
-            }
-
-            // prepare acceleration
-            Vector3f accel_vector;
-            if (!acc_ignore) {
-                // convert to cm
-                accel_vector = Vector3f(packet.afx * 100.0f, packet.afy * 100.0f, -packet.afz * 100.0f);
-                // rotate to body-frame if necessary
-                if (packet.coordinate_frame == MAV_FRAME_BODY_NED || packet.coordinate_frame == MAV_FRAME_BODY_OFFSET_NED) {
-                    plopter.rotate_body_frame_to_NE(accel_vector.x, accel_vector.y);
-                }
-            }
-
-            // prepare yaw
-            float yaw_cd = 0.0f;
-            bool yaw_relative = false;
-            float yaw_rate_cds = 0.0f;
-            if (!yaw_ignore) {
-                yaw_cd = ToDeg(packet.yaw) * 100.0f;
-                yaw_relative = packet.coordinate_frame == MAV_FRAME_BODY_NED || packet.coordinate_frame == MAV_FRAME_BODY_OFFSET_NED;
-            }
-            if (!yaw_rate_ignore) {
-                yaw_rate_cds = ToDeg(packet.yaw_rate) * 100.0f;
-            }
-
-            // send request
-            if (!pos_ignore && !vel_ignore) {
-                plopter.mode_guided.set_destination_posvelaccel(pos_vector, vel_vector, accel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
-            } else if (pos_ignore && !vel_ignore) {
-                plopter.mode_guided.set_velaccel(vel_vector, accel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
-            } else if (pos_ignore && vel_ignore && !acc_ignore) {
-                plopter.mode_guided.set_accel(accel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative);
-            } else if (!pos_ignore && vel_ignore && acc_ignore) {
-                plopter.mode_guided.set_destination(pos_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds, yaw_relative, false);
-            } else {
-                // input is not valid so stop
-                plopter.mode_guided.init(true);
-            }
-
-            break;
-        }
-
-        case MAVLINK_MSG_ID_SET_POSITION_TARGET_GLOBAL_INT:    // MAV ID: 86
-        {
-            // decode packet
-            mavlink_set_position_target_global_int_t packet;
-            mavlink_msg_set_position_target_global_int_decode(&msg, &packet);
-
-            // exit if vehicle is not in Guided mode or Auto-Guided mode
-            if (!plopter.flightmode->in_guided_mode()) {
-                break;
-            }
-
-            // todo: do we need to check for supported coordinate frames
-
-            bool pos_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_POS_IGNORE;
-            bool vel_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_VEL_IGNORE;
-            bool acc_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_ACC_IGNORE;
-            bool yaw_ignore      = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_YAW_IGNORE;
-            bool yaw_rate_ignore = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_YAW_RATE_IGNORE;
-            bool force_set       = packet.type_mask & MAVLINK_SET_POS_TYPE_MASK_FORCE_SET;
-
-            // Force inputs are not supported
-            // Do not accept command if force_set is true and acc_ignore is false
-            if (force_set && !acc_ignore) {
-                break;
-            }
-
-            // extract location from message
-            Location loc;
-            if (!pos_ignore) {
-                // sanity check location
-                if (!check_latlng(packet.lat_int, packet.lon_int)) {
-                    // input is not valid so stop
-                    plopter.mode_guided.init(true);
-                    break;
-                }
-                Location::AltFrame frame;
-                if (!mavlink_coordinate_frame_to_location_alt_frame((MAV_FRAME)packet.coordinate_frame, frame)) {
-                    // unknown coordinate frame
-                    // input is not valid so stop
-                    plopter.mode_guided.init(true);
-                    break;
-                }
-                loc = {packet.lat_int, packet.lon_int, int32_t(packet.alt*100), frame};
-            }
-
-            // prepare velocity
-            Vector3f vel_vector;
-            if (!vel_ignore) {
-                // convert to cm
-                vel_vector = Vector3f(packet.vx * 100.0f, packet.vy * 100.0f, -packet.vz * 100.0f);
-            }
-
-            // prepare acceleration
-            Vector3f accel_vector;
-            if (!acc_ignore) {
-                // convert to cm
-                accel_vector = Vector3f(packet.afx * 100.0f, packet.afy * 100.0f, -packet.afz * 100.0f);
-            }
-
-            // prepare yaw
-            float yaw_cd = 0.0f;
-            float yaw_rate_cds = 0.0f;
-            if (!yaw_ignore) {
-                yaw_cd = ToDeg(packet.yaw) * 100.0f;
-            }
-            if (!yaw_rate_ignore) {
-                yaw_rate_cds = ToDeg(packet.yaw_rate) * 100.0f;
-            }
-
-            // send targets to the appropriate guided mode controller
-            if (!pos_ignore && !vel_ignore) {
-                // convert Location to vector from ekf origin for posvel controller
-                if (loc.get_alt_frame() == Location::AltFrame::ABOVE_TERRAIN) {
-                    // posvel controller does not support alt-above-terrain
-                    // input is not valid so stop
-                    plopter.mode_guided.init(true);
-                    break;
-                }
-                Vector3f pos_neu_cm;
-                if (!loc.get_vector_from_origin_NEU(pos_neu_cm)) {
-                    // input is not valid so stop
-                    plopter.mode_guided.init(true);
-                    break;
-                }
-                plopter.mode_guided.set_destination_posvel(pos_neu_cm, vel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds);
-            } else if (pos_ignore && !vel_ignore) {
-                plopter.mode_guided.set_velaccel(vel_vector, accel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds);
-            } else if (pos_ignore && vel_ignore && !acc_ignore) {
-                plopter.mode_guided.set_accel(accel_vector, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds);
-            } else if (!pos_ignore && vel_ignore && acc_ignore) {
-                plopter.mode_guided.set_destination(loc, !yaw_ignore, yaw_cd, !yaw_rate_ignore, yaw_rate_cds);
-            } else {
-                // input is not valid so stop
-                plopter.mode_guided.init(true);
-            }
-
-            break;
-        }
-#endif
-
-        case MAVLINK_MSG_ID_RADIO:
-        case MAVLINK_MSG_ID_RADIO_STATUS:       // MAV ID: 109
-        {
-            handle_radio_status(msg, plopter.should_log(MASK_LOG_PM));
-            break;
-        }
-
-        case MAVLINK_MSG_ID_TERRAIN_DATA:
-        case MAVLINK_MSG_ID_TERRAIN_CHECK:
+    case MAVLINK_MSG_ID_TERRAIN_DATA:
+    case MAVLINK_MSG_ID_TERRAIN_CHECK:
 #if AP_TERRAIN_AVAILABLE
-            plopter.terrain.handle_data(chan, msg);
+        plopter.terrain.handle_data(chan, msg);
 #endif
-            break;
+        break;
 
-#if TOY_MODE_ENABLED == ENABLED
-        case MAVLINK_MSG_ID_NAMED_VALUE_INT:
-            plopter.g2.toy_mode.handle_message(msg);
-            break;
-#endif
+    case MAVLINK_MSG_ID_SET_ATTITUDE_TARGET:
+    {
+        // Only allow companion computer (or other external controller) to
+        // control attitude in GUIDED mode.  We DON'T want external control
+        // in e.g., RTL, CICLE. Specifying a single mode for companion
+        // computer control is more safe (even more so when using
+        // FENCE_ACTION = 4 for geofence failures).
+        if (plopter.control_mode != &plopter.mode_guided) { // don't screw up failsafes
+            break; 
+        }
 
-        default:
-            handle_common_message(msg);
+        mavlink_set_attitude_target_t att_target;
+        mavlink_msg_set_attitude_target_decode(&msg, &att_target);
+
+        // Mappings: If any of these bits are set, the corresponding input should be ignored.
+        // NOTE, when parsing the bits we invert them for easier interpretation but transport has them inverted
+        // bit 1: body roll rate
+        // bit 2: body pitch rate
+        // bit 3: body yaw rate
+        // bit 4: unknown
+        // bit 5: unknown
+        // bit 6: reserved
+        // bit 7: throttle
+        // bit 8: attitude
+
+        // if not setting all Quaternion values, use _rate flags to indicate which fields.
+
+        // Extract the Euler roll angle from the Quaternion.
+        Quaternion q(att_target.q[0], att_target.q[1],
+                att_target.q[2], att_target.q[3]);
+
+        // NOTE: att_target.type_mask is inverted for easier interpretation
+        att_target.type_mask = att_target.type_mask ^ 0xFF;
+
+        uint8_t attitude_mask = att_target.type_mask & 0b10000111; // q plus rpy
+
+        uint32_t now = AP_HAL::millis();
+        if ((attitude_mask & 0b10000001) ||    // partial, including roll
+                (attitude_mask == 0b10000000)) { // all angles
+            plopter.guided_state.forced_rpy_cd.x = degrees(q.get_euler_roll()) * 100.0f;
+
+            // Update timer for external roll to the nav control
+            plopter.guided_state.last_forced_rpy_ms.x = now;
+        }
+
+        if ((attitude_mask & 0b10000010) ||    // partial, including pitch
+                (attitude_mask == 0b10000000)) { // all angles
+            plopter.guided_state.forced_rpy_cd.y = degrees(q.get_euler_pitch()) * 100.0f;
+
+            // Update timer for external pitch to the nav control
+            plopter.guided_state.last_forced_rpy_ms.y = now;
+        }
+
+        if ((attitude_mask & 0b10000100) ||    // partial, including yaw
+                (attitude_mask == 0b10000000)) { // all angles
+            plopter.guided_state.forced_rpy_cd.z = degrees(q.get_euler_yaw()) * 100.0f;
+
+            // Update timer for external yaw to the nav control
+            plopter.guided_state.last_forced_rpy_ms.z = now;
+        }
+        if (att_target.type_mask & 0b01000000) { // throttle
+            plopter.guided_state.forced_throttle = att_target.thrust * 100.0f;
+
+            // Update timer for external throttle
+            plopter.guided_state.last_forced_throttle_ms = now;
+        }
+
+        break;
+    }
+
+    case MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED:
+    {
+        // decode packet
+        mavlink_set_position_target_local_ned_t packet;
+        mavlink_msg_set_position_target_local_ned_decode(&msg, &packet);
+
+        // exit if vehicle is not in Guided mode
+        if (plopter.control_mode != &plopter.mode_guided) {
             break;
-    }     // end switch
+        }
+
+        // only local moves for now
+        if (packet.coordinate_frame != MAV_FRAME_LOCAL_OFFSET_NED) {
+            break;
+        }
+
+        // just do altitude for now
+        plopter.next_WP_loc.alt += -packet.z*100.0;
+        gcs().send_text(MAV_SEVERITY_INFO, "Change alt to %.1f",
+                        (double)((plopter.next_WP_loc.alt - plopter.home.alt)*0.01));
+        
+        break;
+    }
+
+    case MAVLINK_MSG_ID_SET_POSITION_TARGET_GLOBAL_INT:
+    {
+        // Only want to allow companion computer position control when
+        // in a certain mode to avoid inadvertently sending these
+        // kinds of commands when the autopilot is responding to problems
+        // in modes such as RTL, CIRCLE, etc.  Specifying ONLY one mode
+        // for companion computer control is more safe (provided
+        // one uses the FENCE_ACTION = 4 (RTL) for geofence failures).
+        if (plopter.control_mode != &plopter.mode_guided) {
+            //don't screw up failsafes
+            break;
+        }
+
+        mavlink_set_position_target_global_int_t pos_target;
+        mavlink_msg_set_position_target_global_int_decode(&msg, &pos_target);
+        // Unexpectedly, the mask is expecting "ones" for dimensions that should
+        // be IGNORNED rather than INCLUDED.  See mavlink documentation of the
+        // SET_POSITION_TARGET_GLOBAL_INT message, type_mask field.
+        const uint16_t alt_mask = 0b1111111111111011; // (z mask at bit 3)
+            
+        bool msg_valid = true;
+        AP_Mission::Mission_Command cmd = {0};
+        
+        if (pos_target.type_mask & alt_mask)
+        {
+            cmd.content.location.alt = pos_target.alt * 100;
+            cmd.content.location.relative_alt = false;
+            cmd.content.location.terrain_alt = false;
+            switch (pos_target.coordinate_frame) 
+            {
+                case MAV_FRAME_GLOBAL:
+                case MAV_FRAME_GLOBAL_INT:
+                    break; //default to MSL altitude
+                case MAV_FRAME_GLOBAL_RELATIVE_ALT_INT:
+                    cmd.content.location.relative_alt = true;
+                    break;
+                case MAV_FRAME_GLOBAL_TERRAIN_ALT_INT:
+                    cmd.content.location.relative_alt = true;
+                    cmd.content.location.terrain_alt = true;
+                    break;
+                default:
+                    gcs().send_text(MAV_SEVERITY_WARNING, "Invalid coord frame in SET_POSTION_TARGET_GLOBAL_INT");
+                    msg_valid = false;
+                    break;
+            }    
+
+            if (msg_valid) {
+                handle_change_alt_request(cmd);
+            }
+        } // end if alt_mask       
+
+        break;
+    }
+
+    default:
+        handle_common_message(msg);
+        break;
+    } // end switch
 } // end handle mavlink
 
-
-MAV_RESULT GCS_MAVLINK_Plopter::handle_flight_termination(const mavlink_command_long_t &packet) {
-#if ADVANCED_FAILSAFE == ENABLED
-    if (GCS_MAVLINK::handle_flight_termination(packet) == MAV_RESULT_ACCEPTED) {
-        return MAV_RESULT_ACCEPTED;
-    }
-#endif
-    if (packet.param1 > 0.5f) {
-        plopter.arming.disarm(AP_Arming::Method::TERMINATION);
-        return MAV_RESULT_ACCEPTED;
+MAV_RESULT GCS_MAVLINK_Plopter::handle_command_do_set_mission_current(const mavlink_command_long_t &packet)
+{
+    const MAV_RESULT result = GCS_MAVLINK::handle_command_do_set_mission_current(packet);
+    if (result != MAV_RESULT_ACCEPTED) {
+        return result;
     }
 
-    return MAV_RESULT_FAILED;
+    // if you change this you must change handle_mission_set_current
+    plopter.auto_state.next_wp_crosstrack = false;
+    if (plopter.control_mode == &plopter.mode_auto && plopter.mission.state() == AP_Mission::MISSION_STOPPED) {
+        plopter.mission.resume();
+    }
+
+    return result;
 }
 
-float GCS_MAVLINK_Plopter::vfr_hud_alt() const
+void GCS_MAVLINK_Plopter::handle_mission_set_current(AP_Mission &mission, const mavlink_message_t &msg)
 {
-    if (plopter.g2.dev_options.get() & DevOptionVFR_HUDRelativeAlt) {
-        // compatibility option for older mavlink-aware devices that
-        // assume Plopter returns a relative altitude in VFR_HUD.alt
-        return plopter.current_loc.alt * 0.01f;
+    // if you change this you must change handle_command_do_set_mission_current
+    plopter.auto_state.next_wp_crosstrack = false;
+    GCS_MAVLINK::handle_mission_set_current(mission, msg);
+    if (plopter.control_mode == &plopter.mode_auto && plopter.mission.state() == AP_Mission::MISSION_STOPPED) {
+        plopter.mission.resume();
     }
-    return GCS_MAVLINK::vfr_hud_alt();
 }
 
 uint64_t GCS_MAVLINK_Plopter::capabilities() const
 {
     return (MAV_PROTOCOL_CAPABILITY_MISSION_FLOAT |
-            MAV_PROTOCOL_CAPABILITY_MISSION_INT |
             MAV_PROTOCOL_CAPABILITY_COMMAND_INT |
-            MAV_PROTOCOL_CAPABILITY_SET_POSITION_TARGET_LOCAL_NED |
+            MAV_PROTOCOL_CAPABILITY_MISSION_INT |
             MAV_PROTOCOL_CAPABILITY_SET_POSITION_TARGET_GLOBAL_INT |
-            MAV_PROTOCOL_CAPABILITY_FLIGHT_TERMINATION |
             MAV_PROTOCOL_CAPABILITY_SET_ATTITUDE_TARGET |
-            #if AP_TERRAIN_AVAILABLE
+#if AP_TERRAIN_AVAILABLE
             (plopter.terrain.enabled() ? MAV_PROTOCOL_CAPABILITY_TERRAIN : 0) |
-            #endif
+#endif
             GCS_MAVLINK::capabilities());
-}
-
-MAV_LANDED_STATE GCS_MAVLINK_Plopter::landed_state() const
-{
-    if (plopter.ap.land_complete) {
-        return MAV_LANDED_STATE_ON_GROUND;
-    }
-    if (plopter.flightmode->is_landing()) {
-        return MAV_LANDED_STATE_LANDING;
-    }
-    if (plopter.flightmode->is_taking_off()) {
-        return MAV_LANDED_STATE_TAKEOFF;
-    }
-    return MAV_LANDED_STATE_IN_AIR;
-}
-
-void GCS_MAVLINK_Plopter::send_wind() const
-{
-    Vector3f airspeed_vec_bf;
-    if (!AP::ahrs().airspeed_vector_true(airspeed_vec_bf)) {
-        // if we don't have an airspeed estimate then we don't have a
-        // valid wind estimate on plopters
-        return;
-    }
-    const Vector3f wind = AP::ahrs().wind_estimate();
-    mavlink_msg_wind_send(
-            chan,
-            degrees(atan2f(-wind.y, -wind.x)),
-            wind.length(),
-            wind.z);
 }
 
 #if HAL_HIGH_LATENCY2_ENABLED
@@ -1482,66 +1361,90 @@ int16_t GCS_MAVLINK_Plopter::high_latency_target_altitude() const
     struct Location global_position_current;
     UNUSED_RESULT(ahrs.get_location(global_position_current));
 
+#if HAL_QUADPLANE_ENABLED
+    const QuadPlopter &quadplopter = plopter.quadplopter;
     //return units are m
-    if (plopter.ap.initialised) {
-        return 0.01 * (global_position_current.alt + plopter.pos_control->get_pos_error_z_cm());
+    if (quadplopter.show_vtol_view()) {
+        return (plopter.control_mode != &plopter.mode_qstabilize) ? 0.01 * (global_position_current.alt + quadplopter.pos_control->get_pos_error_z_cm()) : 0;
     }
-    return 0;
-    
+#endif
+    return 0.01 * (global_position_current.alt + plopter.altitude_error_cm);
 }
 
 uint8_t GCS_MAVLINK_Plopter::high_latency_tgt_heading() const
 {
-    if (plopter.ap.initialised) {
-        // return units are deg/2
-        const Mode *flightmode = plopter.flightmode;
-        // need to convert -18000->18000 to 0->360/2
-        return wrap_360_cd(flightmode->wp_bearing()) / 200;
+    // return units are deg/2
+#if HAL_QUADPLANE_ENABLED
+    const QuadPlopter &quadplopter = plopter.quadplopter;
+    if (quadplopter.show_vtol_view()) {
+        const Vector3f &targets = quadplopter.attitude_control->get_att_target_euler_cd();
+        return ((uint16_t)(targets.z * 0.01)) / 2;
     }
-    return 0;     
+#endif
+        const AP_Navigation *nav_controller = plopter.nav_controller;
+        // need to convert -18000->18000 to 0->360/2
+        return wrap_360_cd(nav_controller->target_bearing_cd() ) / 200;
 }
-    
+
+// return units are dm
 uint16_t GCS_MAVLINK_Plopter::high_latency_tgt_dist() const
 {
-    if (plopter.ap.initialised) {
-        // return units are dm
-        const Mode *flightmode = plopter.flightmode;
-        return MIN(flightmode->wp_distance() * 1.0e-2, UINT16_MAX) / 10;
+#if HAL_QUADPLANE_ENABLED
+    const QuadPlopter &quadplopter = plopter.quadplopter;
+    if (quadplopter.show_vtol_view()) {
+        bool wp_nav_valid = quadplopter.using_wp_nav();
+        return (wp_nav_valid ? MIN(quadplopter.wp_nav->get_wp_distance_to_destination(), UINT16_MAX) : 0) / 10;
     }
-    return 0;
+    #endif
+
+    return MIN(plopter.auto_state.wp_distance, UINT16_MAX) / 10;
 }
 
 uint8_t GCS_MAVLINK_Plopter::high_latency_tgt_airspeed() const
 {
-    if (plopter.ap.initialised) {
-        // return units are m/s*5
-        return MIN(plopter.pos_control->get_vel_target_cms().length() * 5.0e-2, UINT8_MAX);
-    }
-    return 0;  
+    // return units are m/s*5
+    return plopter.target_airspeed_cm * 0.05;
 }
 
 uint8_t GCS_MAVLINK_Plopter::high_latency_wind_speed() const
 {
-    Vector3f airspeed_vec_bf;
     Vector3f wind;
+    wind = AP::ahrs().wind_estimate();
+
     // return units are m/s*5
-    if (AP::ahrs().airspeed_vector_true(airspeed_vec_bf)) {
-        wind = AP::ahrs().wind_estimate();
-        return wind.length() * 5;
-    }
-    return 0; 
+    return MIN(wind.length() * 5, UINT8_MAX);
 }
 
 uint8_t GCS_MAVLINK_Plopter::high_latency_wind_direction() const
 {
-    Vector3f airspeed_vec_bf;
-    Vector3f wind;
+    const Vector3f wind = AP::ahrs().wind_estimate();
+
     // return units are deg/2
-    if (AP::ahrs().airspeed_vector_true(airspeed_vec_bf)) {
-        wind = AP::ahrs().wind_estimate();
-        // need to convert -180->180 to 0->360/2
-        return wrap_360(degrees(atan2f(-wind.y, -wind.x))) / 2;
-    }
-    return 0;
+    // need to convert -180->180 to 0->360/2
+    return wrap_360(degrees(atan2f(-wind.y, -wind.x))) / 2;
 }
 #endif // HAL_HIGH_LATENCY2_ENABLED
+
+MAV_VTOL_STATE GCS_MAVLINK_Plopter::vtol_state() const
+{
+#if !HAL_QUADPLANE_ENABLED
+    return MAV_VTOL_STATE_UNDEFINED;
+#else
+    if (!plopter.quadplopter.available()) {
+        return MAV_VTOL_STATE_UNDEFINED;
+    }
+
+    return plopter.quadplopter.transition->get_mav_vtol_state();
+#endif
+};
+
+MAV_LANDED_STATE GCS_MAVLINK_Plopter::landed_state() const
+{
+    if (plopter.is_flying()) {
+        // note that Q-modes almost always consider themselves as flying
+        return MAV_LANDED_STATE_IN_AIR;
+    }
+
+    return MAV_LANDED_STATE_ON_GROUND;
+}
+

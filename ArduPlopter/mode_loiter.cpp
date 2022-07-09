@@ -1,216 +1,97 @@
+#include "mode.h"
 #include "Plopter.h"
 
-#if MODE_LOITER_ENABLED == ENABLED
-
-/*
- * Init and run calls for loiter flight mode
- */
-
-// loiter_init - initialise loiter controller
-bool ModeLoiter::init(bool ignore_checks)
+bool ModeLoiter::_enter()
 {
-    if (!plopter.failsafe.radio) {
-        float target_roll, target_pitch;
-        // apply SIMPLE mode transform to pilot inputs
-        update_simple_mode();
+    plopter.do_loiter_at_location();
+    plopter.setup_terrain_target_alt(plopter.next_WP_loc);
 
-        // convert pilot input to lean angles
-        get_pilot_desired_lean_angles(target_roll, target_pitch, loiter_nav->get_angle_max_cd(), attitude_control->get_althold_lean_angle_max_cd());
-
-        // process pilot's roll and pitch input
-        loiter_nav->set_pilot_desired_acceleration(target_roll, target_pitch);
-    } else {
-        // clear out pilot desired acceleration in case radio failsafe event occurs and we do not switch to RTL for some reason
-        loiter_nav->clear_pilot_desired_acceleration();
-    }
-    loiter_nav->init_target();
-
-    // initialise the vertical position controller
-    if (!pos_control->is_active_z()) {
-        pos_control->init_z_controller();
+    // make sure the local target altitude is the same as the nav target used for loiter nav
+    // this allows us to do FBWB style stick control
+    /*IGNORE_RETURN(plopter.next_WP_loc.get_alt_cm(Location::AltFrame::ABSOLUTE, plopter.target_altitude.amsl_cm));*/
+    if (plopter.stick_mixing_enabled() && (plopter.g2.flight_options & FlightOptions::ENABLE_LOITER_ALT_CONTROL)) {
+        plopter.set_target_altitude_current();
     }
 
-    // set vertical speed and acceleration limits
-    pos_control->set_max_speed_accel_z(-get_pilot_speed_dn(), g.pilot_speed_up, g.pilot_accel_z);
-    pos_control->set_correction_speed_accel_z(-get_pilot_speed_dn(), g.pilot_speed_up, g.pilot_accel_z);
-
-#if PRECISION_LANDING == ENABLED
-    _precision_loiter_active = false;
-#endif
+    plopter.loiter_angle_reset();
 
     return true;
 }
 
-#if PRECISION_LANDING == ENABLED
-bool ModeLoiter::do_precision_loiter()
+void ModeLoiter::update()
 {
-    if (!_precision_loiter_enabled) {
-        return false;
-    }
-    if (plopter.ap.land_complete_maybe) {
-        return false;        // don't move on the ground
-    }
-    // if the pilot *really* wants to move the vehicle, let them....
-    if (loiter_nav->get_pilot_desired_acceleration().length() > 50.0f) {
-        return false;
-    }
-    if (!plopter.precland.target_acquired()) {
-        return false; // we don't have a good vector
-    }
-    return true;
-}
-
-void ModeLoiter::precision_loiter_xy()
-{
-    loiter_nav->clear_pilot_desired_acceleration();
-    Vector2f target_pos, target_vel;
-    if (!plopter.precland.get_target_position_cm(target_pos)) {
-        target_pos = inertial_nav.get_position_xy_cm();
-    }
-    // get the velocity of the target
-    plopter.precland.get_target_velocity_cms(inertial_nav.get_velocity_xy_cms(), target_vel);
-
-    Vector2f zero;
-    Vector2p landing_pos = target_pos.topostype();
-    // target vel will remain zero if landing target is stationary
-    pos_control->input_pos_vel_accel_xy(landing_pos, target_vel, zero);
-    // run pos controller
-    pos_control->update_xy_controller();
-}
-#endif
-
-// loiter_run - runs the loiter controller
-// should be called at 100hz or more
-void ModeLoiter::run()
-{
-    float target_roll, target_pitch;
-    float target_yaw_rate = 0.0f;
-    float target_climb_rate = 0.0f;
-
-    // set vertical speed and acceleration limits
-    pos_control->set_max_speed_accel_z(-get_pilot_speed_dn(), g.pilot_speed_up, g.pilot_accel_z);
-
-    // process pilot inputs unless we are in radio failsafe
-    if (!plopter.failsafe.radio) {
-        // apply SIMPLE mode transform to pilot inputs
-        update_simple_mode();
-
-        // convert pilot input to lean angles
-        get_pilot_desired_lean_angles(target_roll, target_pitch, loiter_nav->get_angle_max_cd(), attitude_control->get_althold_lean_angle_max_cd());
-
-        // process pilot's roll and pitch input
-        loiter_nav->set_pilot_desired_acceleration(target_roll, target_pitch);
-
-        // get pilot's desired yaw rate
-        target_yaw_rate = get_pilot_desired_yaw_rate(channel_yaw->norm_input_dz());
-
-        // get pilot desired climb rate
-        target_climb_rate = get_pilot_desired_climb_rate(channel_throttle->get_control_in());
-        target_climb_rate = constrain_float(target_climb_rate, -get_pilot_speed_dn(), g.pilot_speed_up);
+    plopter.calc_nav_roll();
+    if (plopter.stick_mixing_enabled() && (plopter.g2.flight_options & FlightOptions::ENABLE_LOITER_ALT_CONTROL)) {
+        plopter.update_fbwb_speed_height();
     } else {
-        // clear out pilot desired acceleration in case radio failsafe event occurs and we do not switch to RTL for some reason
-        loiter_nav->clear_pilot_desired_acceleration();
+        plopter.calc_nav_pitch();
+        plopter.calc_throttle();
     }
-
-    // relax loiter target if we might be landed
-    if (plopter.ap.land_complete_maybe) {
-        loiter_nav->soften_for_landing();
-    }
-
-    // Loiter State Machine Determination
-    AltHoldModeState loiter_state = get_alt_hold_state(target_climb_rate);
-
-    // Loiter State Machine
-    switch (loiter_state) {
-
-    case AltHold_MotorStopped:
-        attitude_control->reset_rate_controller_I_terms();
-        attitude_control->reset_yaw_target_and_rate();
-        pos_control->relax_z_controller(0.0f);   // forces throttle output to decay to zero
-        loiter_nav->init_target();
-        attitude_control->input_thrust_vector_rate_heading(loiter_nav->get_thrust_vector(), target_yaw_rate, false);
-        break;
-
-    case AltHold_Takeoff:
-        // initiate take-off
-        if (!takeoff.running()) {
-            takeoff.start(constrain_float(g.pilot_takeoff_alt,0.0f,1000.0f));
-        }
-
-        // get avoidance adjusted climb rate
-        target_climb_rate = get_avoidance_adjusted_climbrate(target_climb_rate);
-
-        // set position controller targets adjusted for pilot input
-        takeoff.do_pilot_takeoff(target_climb_rate);
-
-        // run loiter controller
-        loiter_nav->update();
-
-        // call attitude controller
-        attitude_control->input_thrust_vector_rate_heading(loiter_nav->get_thrust_vector(), target_yaw_rate, false);
-        break;
-
-    case AltHold_Landed_Ground_Idle:
-        attitude_control->reset_yaw_target_and_rate();
-        FALLTHROUGH;
-
-    case AltHold_Landed_Pre_Takeoff:
-        attitude_control->reset_rate_controller_I_terms_smoothly();
-        loiter_nav->init_target();
-        attitude_control->input_thrust_vector_rate_heading(loiter_nav->get_thrust_vector(), target_yaw_rate, false);
-        pos_control->relax_z_controller(0.0f);   // forces throttle output to decay to zero
-        break;
-
-    case AltHold_Flying:
-        // set motors to full range
-        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
-
-#if PRECISION_LANDING == ENABLED
-        bool precision_loiter_old_state = _precision_loiter_active;
-        if (do_precision_loiter()) {
-            precision_loiter_xy();
-            _precision_loiter_active = true;
-        } else {
-            _precision_loiter_active = false;
-        }
-        if (precision_loiter_old_state && !_precision_loiter_active) {
-            // prec loiter was active, not any more, let's init again as user takes control
-            loiter_nav->init_target();
-        }
-        // run loiter controller if we are not doing prec loiter
-        if (!_precision_loiter_active) {
-            loiter_nav->update();
-        }
-#else
-        loiter_nav->update();
-#endif
-
-        // call attitude controller
-        attitude_control->input_thrust_vector_rate_heading(loiter_nav->get_thrust_vector(), target_yaw_rate, false);
-
-        // get avoidance adjusted climb rate
-        target_climb_rate = get_avoidance_adjusted_climbrate(target_climb_rate);
-
-        // update the vertical offset based on the surface measurement
-        plopter.surface_tracking.update_surface_offset();
-
-        // Send the commanded climb rate to the position controller
-        pos_control->set_pos_target_z_from_climb_rate_cm(target_climb_rate);
-        break;
-    }
-
-    // run the vertical position controller and set output throttle
-    pos_control->update_z_controller();
 }
 
-uint32_t ModeLoiter::wp_distance() const
+bool ModeLoiter::isHeadingLinedUp(const Location loiterCenterLoc, const Location targetLoc)
 {
-    return loiter_nav->get_distance_to_target();
+    // Return true if current heading is aligned to vector to targetLoc.
+    // Tolerance is initially 10 degrees and grows at 10 degrees for each loiter circle completed.
+
+    const uint16_t loiterRadius = abs(plopter.aparm.loiter_radius);
+    if (loiterCenterLoc.get_distance(targetLoc) < loiterRadius + loiterRadius*0.05) {
+        /* Whenever next waypoint is within the loiter radius plus 5%,
+           maintaining loiter would prevent us from ever pointing toward the next waypoint.
+           Hence break out of loiter immediately
+         */
+        return true;
+    }
+
+    // Bearing in centi-degrees
+    const int32_t bearing_cd = plopter.current_loc.get_bearing_to(targetLoc);
+    return isHeadingLinedUp_cd(bearing_cd);
 }
 
-int32_t ModeLoiter::wp_bearing() const
+
+bool ModeLoiter::isHeadingLinedUp_cd(const int32_t bearing_cd)
 {
-    return loiter_nav->get_bearing_to_target();
+    // Return true if current heading is aligned to bearing_cd.
+    // Tolerance is initially 10 degrees and grows at 10 degrees for each loiter circle completed.
+
+    // get current heading.
+    const int32_t heading_cd = (wrap_360(degrees(plopter.ahrs.groundspeed_vector().angle())))*100;
+
+    const int32_t heading_err_cd = wrap_180_cd(bearing_cd - heading_cd);
+
+    /*
+      Check to see if the the plopter is heading toward the land
+      waypoint. We use 20 degrees (+/-10 deg) of margin so that
+      we can handle 200 degrees/second of yaw.
+
+      After every full circle, extend acceptance criteria to ensure
+      aircraft will not loop forever in case high winds are forcing
+      it beyond 200 deg/sec when passing the desired exit course
+    */
+
+    // Use integer division to get discrete steps
+    const int32_t expanded_acceptance = 1000 * (labs(plopter.loiter.sum_cd) / 36000);
+
+    if (labs(heading_err_cd) <= 1000 + expanded_acceptance) {
+        // Want to head in a straight line from _here_ to the next waypoint instead of center of loiter wp
+
+        // 0 to xtrack from center of waypoint, 1 to xtrack from tangent exit location
+        if (plopter.next_WP_loc.loiter_xtrack) {
+            plopter.next_WP_loc = plopter.current_loc;
+        }
+        return true;
+    }
+    return false;
 }
 
-#endif
+void ModeLoiter::navigate()
+{
+    if (plopter.g2.flight_options & FlightOptions::ENABLE_LOITER_ALT_CONTROL) {
+        // update the WP alt from the global target adjusted by update_fbwb_speed_height
+        plopter.next_WP_loc.set_alt_cm(plopter.target_altitude.amsl_cm, Location::AltFrame::ABSOLUTE);
+    }
+
+    // Zero indicates to use WP_LOITER_RAD
+    plopter.update_loiter(0);
+}
+

@@ -155,6 +155,12 @@ public:
     float               get_lateral() const { return _lateral_in; }
     virtual float       get_throttle_hover() const = 0;
 
+
+    //set motor output for plopter //hairystew
+    void set_output();
+
+
+
     // motor failure handling
     void                set_thrust_boost(bool enable) { _thrust_boost = enable; }
     bool                get_thrust_boost() const { return _thrust_boost; }

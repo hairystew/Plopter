@@ -1,127 +1,106 @@
 #pragma once
 
-#include <AP_HAL/AP_HAL_Boards.h>
+// Internal defines, don't edit and expect things to work
+// -------------------------------------------------------
 
-// Just so that it's completely clear...
-#define ENABLED                 1
-#define DISABLED                0
+#define SERVO_MAX 4500.0  // This value represents 45 degrees and is just an
+                        // arbitrary representation of servo max travel.
 
-// this avoids a very common config error
-#define ENABLE ENABLED
-#define DISABLE DISABLED
-
-// Autopilot Yaw Mode enumeration
-enum autopilot_yaw_mode {
-    AUTO_YAW_HOLD =             0,  // pilot controls the heading
-    AUTO_YAW_LOOK_AT_NEXT_WP =  1,  // point towards next waypoint (no pilot input accepted)
-    AUTO_YAW_ROI =              2,  // point towards a location held in roi (no pilot input accepted)
-    AUTO_YAW_FIXED =            3,  // point towards a particular angle (no pilot input accepted)
-    AUTO_YAW_LOOK_AHEAD =       4,  // point in the direction the plopter is moving
-    AUTO_YAW_RESETTOARMEDYAW =  5,  // point towards heading at time motors were armed
-    AUTO_YAW_ANGLE_RATE =       6,  // turn at a specified rate from a starting angle
-    AUTO_YAW_RATE =             7,  // turn at a specified rate (held in auto_yaw_rate)
-    AUTO_YAW_CIRCLE =           8,  // use AC_Circle's provided yaw (used during Loiter-Turns commands)
+// failsafe
+// ----------------------
+enum failsafe_state {
+    FAILSAFE_NONE=0,
+    FAILSAFE_SHORT=1,
+    FAILSAFE_LONG=2,
+    FAILSAFE_GCS=3
 };
 
-// Frame types
-#define UNDEFINED_FRAME 0
-#define MULTICOPTER_FRAME 1
-#define HELI_FRAME 2
 
-// Tuning enumeration
-enum tuning_func {
-    TUNING_NONE =                        0, //
-    TUNING_STABILIZE_ROLL_PITCH_KP =     1, // stabilize roll/pitch angle controller's P term
-    TUNING_STABILIZE_YAW_KP =            3, // stabilize yaw heading controller's P term
-    TUNING_RATE_ROLL_PITCH_KP =          4, // body frame roll/pitch rate controller's P term
-    TUNING_RATE_ROLL_PITCH_KI =          5, // body frame roll/pitch rate controller's I term
-    TUNING_YAW_RATE_KP =                 6, // body frame yaw rate controller's P term
-    TUNING_THROTTLE_RATE_KP =            7, // throttle rate controller's P term (desired rate to acceleration or motor output)
-    TUNING_WP_SPEED =                   10, // maximum speed to next way point (0 to 10m/s)
-    TUNING_LOITER_POSITION_KP =         12, // loiter distance controller's P term (position error to speed)
-    TUNING_HELI_EXTERNAL_GYRO =         13, // TradHeli specific external tail gyro gain
-    TUNING_ALTITUDE_HOLD_KP =           14, // altitude hold controller's P term (alt error to desired rate)
-    TUNING_RATE_ROLL_PITCH_KD =         21, // body frame roll/pitch rate controller's D term
-    TUNING_VEL_XY_KP =                  22, // loiter rate controller's P term (speed error to tilt angle)
-    TUNING_ACRO_RP_RATE =               25, // acro controller's desired roll and pitch rate in deg/s
-    TUNING_YAW_RATE_KD =                26, // body frame yaw rate controller's D term
-    TUNING_VEL_XY_KI =                  28, // loiter rate controller's I term (speed error to tilt angle)
-    TUNING_AHRS_YAW_KP =                30, // ahrs's compass effect on yaw angle (0 = very low, 1 = very high)
-    TUNING_AHRS_KP =                    31, // accelerometer effect on roll/pitch angle (0=low)
-    TUNING_ACCEL_Z_KP =                 34, // accel based throttle controller's P term
-    TUNING_ACCEL_Z_KI =                 35, // accel based throttle controller's I term
-    TUNING_ACCEL_Z_KD =                 36, // accel based throttle controller's D term
-    TUNING_DECLINATION =                38, // compass declination in radians
-    TUNING_CIRCLE_RATE =                39, // circle turn rate in degrees (hard coded to about 45 degrees in either direction)
-    TUNING_ACRO_YAW_RATE =              40, // acro controller's desired yaw rate in deg/s
-    TUNING_RANGEFINDER_GAIN =           41, // unused
-    TUNING_EKF_VERTICAL_POS =           42, // unused
-    TUNING_EKF_HORIZONTAL_POS =         43, // unused
-    TUNING_EKF_ACCEL_NOISE =            44, // unused
-    TUNING_RC_FEEL_RP =                 45, // roll-pitch input smoothing
-    TUNING_RATE_PITCH_KP =              46, // body frame pitch rate controller's P term
-    TUNING_RATE_PITCH_KI =              47, // body frame pitch rate controller's I term
-    TUNING_RATE_PITCH_KD =              48, // body frame pitch rate controller's D term
-    TUNING_RATE_ROLL_KP =               49, // body frame roll rate controller's P term
-    TUNING_RATE_ROLL_KI =               50, // body frame roll rate controller's I term
-    TUNING_RATE_ROLL_KD =               51, // body frame roll rate controller's D term
-    TUNING_RATE_PITCH_FF =              52, // body frame pitch rate controller FF term
-    TUNING_RATE_ROLL_FF =               53, // body frame roll rate controller FF term
-    TUNING_RATE_YAW_FF =                54, // body frame yaw rate controller FF term
-    TUNING_RATE_MOT_YAW_HEADROOM =      55, // motors yaw headroom minimum
-    TUNING_RATE_YAW_FILT =              56, // yaw rate input filter
-    UNUSED =                            57, // was winch control
-    TUNING_SYSTEM_ID_MAGNITUDE =        58  // magnitude of the system ID signal
+// GCS failsafe types for FS_GCS_ENABL parameter
+enum gcs_failsafe {
+    GCS_FAILSAFE_OFF        = 0, // no GCS failsafe
+    GCS_FAILSAFE_HEARTBEAT  = 1, // failsafe if we stop receiving heartbeat
+    GCS_FAILSAFE_HB_RSSI    = 2, // failsafe if we stop receiving
+                                 // heartbeat or if RADIO.remrssi
+                                 // drops to 0
+    GCS_FAILSAFE_HB_AUTO    = 3  // failsafe if we stop receiving heartbeat
+                                 // while in AUTO mode
 };
 
-// Yaw behaviours during missions - possible values for WP_YAW_BEHAVIOR parameter
-#define WP_YAW_BEHAVIOR_NONE                          0   // auto pilot will never control yaw during missions or rtl (except for DO_CONDITIONAL_YAW command received)
-#define WP_YAW_BEHAVIOR_LOOK_AT_NEXT_WP               1   // auto pilot will face next waypoint or home during rtl
-#define WP_YAW_BEHAVIOR_LOOK_AT_NEXT_WP_EXCEPT_RTL    2   // auto pilot will face next waypoint except when doing RTL at which time it will stay in it's last
-#define WP_YAW_BEHAVIOR_LOOK_AHEAD                    3   // auto pilot will look ahead during missions and rtl (primarily meant for traditional heliplopters)
-
-
-// Airmode
-enum class AirMode {
-    AIRMODE_NONE,
-    AIRMODE_DISABLED,
-    AIRMODE_ENABLED,
+enum failsafe_action_short {
+    FS_ACTION_SHORT_BESTGUESS = 0,      // CIRCLE/no change(if already in AUTO|GUIDED|LOITER)
+    FS_ACTION_SHORT_CIRCLE = 1,
+    FS_ACTION_SHORT_FBWA = 2,
+    FS_ACTION_SHORT_DISABLED = 3,
+    FS_ACTION_SHORT_FBWB = 4,
 };
 
-enum PayloadPlaceStateType {
-    PayloadPlaceStateType_FlyToLocation,
-    PayloadPlaceStateType_Calibrating_Hover_Start,
-    PayloadPlaceStateType_Calibrating_Hover,
-    PayloadPlaceStateType_Descending_Start,
-    PayloadPlaceStateType_Descending,
-    PayloadPlaceStateType_Releasing_Start,
-    PayloadPlaceStateType_Releasing,
-    PayloadPlaceStateType_Released,
-    PayloadPlaceStateType_Ascending_Start,
-    PayloadPlaceStateType_Ascending,
-    PayloadPlaceStateType_Done,
+enum failsafe_action_long {
+    FS_ACTION_LONG_CONTINUE = 0,
+    FS_ACTION_LONG_RTL = 1,
+    FS_ACTION_LONG_GLIDE = 2,
+    FS_ACTION_LONG_PARACHUTE = 3,
 };
 
-// bit options for DEV_OPTIONS parameter
-enum DevOptions {
-    DevOptionADSBMAVLink = 1,
-    DevOptionVFR_HUDRelativeAlt = 2,
+// type of stick mixing enabled
+enum class StickMixing {
+    NONE     = 0,
+    FBW      = 1,
+    DIRECT   = 2,
+    VTOL_YAW = 3,
 };
 
-//  Logging parameters - only 32 messages are available to the vehicle here.
-enum LoggingParameters {
-     LOG_CONTROL_TUNING_MSG,
-     LOG_DATA_INT16_MSG,
-     LOG_DATA_UINT16_MSG,
-     LOG_DATA_INT32_MSG,
-     LOG_DATA_UINT32_MSG,
-     LOG_DATA_FLOAT_MSG,
-     LOG_PARAMTUNE_MSG,
-     LOG_HELI_MSG,
-     LOG_GUIDED_POSITION_TARGET_MSG,
-     LOG_SYSIDD_MSG,
-     LOG_SYSIDS_MSG,
-     LOG_GUIDED_ATTITUDE_TARGET_MSG
+// values for RTL_AUTOLAND
+enum class RtlAutoland {
+    RTL_DISABLE = 0,
+    RTL_THEN_DO_LAND_START = 1,
+    RTL_IMMEDIATE_DO_LAND_START = 2,
+    NO_RTL_GO_AROUND = 3,
+};
+    
+
+enum ChannelMixing {
+    MIXING_DISABLED = 0,
+    MIXING_UPUP     = 1,
+    MIXING_UPDN     = 2,
+    MIXING_DNUP     = 3,
+    MIXING_DNDN     = 4,
+    MIXING_UPUP_SWP = 5,
+    MIXING_UPDN_SWP = 6,
+    MIXING_DNUP_SWP = 7,
+    MIXING_DNDN_SWP = 8,
+};
+
+// PID broadcast bitmask
+enum tuning_pid_bits {
+    TUNING_BITS_ROLL  = (1 <<  0),
+    TUNING_BITS_PITCH = (1 <<  1),
+    TUNING_BITS_YAW   = (1 <<  2),
+    TUNING_BITS_STEER = (1 <<  3),
+    TUNING_BITS_LAND  = (1 <<  4),
+    TUNING_BITS_ACCZ  = (1 <<  5),
+    TUNING_BITS_END // dummy just used for static checking
+};
+
+static_assert(TUNING_BITS_END <= (1 << 24) + 1, "Tuning bit mask is too large to be set by MAVLink");
+
+// Logging message types - only 32 messages are available to the vehicle here.
+enum log_messages {
+    LOG_CTUN_MSG,
+    LOG_NTUN_MSG,
+    LOG_STATUS_MSG,
+    LOG_QTUN_MSG,
+    LOG_PIQR_MSG,
+    LOG_PIQP_MSG,
+    LOG_PIQY_MSG,
+    LOG_PIQA_MSG,
+    LOG_PIDG_MSG,
+    LOG_AETR_MSG,
+    LOG_OFG_MSG,
+    LOG_CMDI_MSG,
+    LOG_CMDA_MSG,
+    LOG_CMDS_MSG,
+    LOG_CMDH_MSG,
 };
 
 #define MASK_LOG_ATTITUDE_FAST          (1<<0)
@@ -130,46 +109,86 @@ enum LoggingParameters {
 #define MASK_LOG_PM                     (1<<3)
 #define MASK_LOG_CTUN                   (1<<4)
 #define MASK_LOG_NTUN                   (1<<5)
-#define MASK_LOG_RCIN                   (1<<6)
+//#define MASK_LOG_MODE                 (1<<6) // no longer used
 #define MASK_LOG_IMU                    (1<<7)
 #define MASK_LOG_CMD                    (1<<8)
 #define MASK_LOG_CURRENT                (1<<9)
-#define MASK_LOG_RCOUT                  (1<<10)
-#define MASK_LOG_OPTFLOW                (1<<11)
-#define MASK_LOG_PID                    (1<<12)
-#define MASK_LOG_COMPASS                (1<<13)
-#define MASK_LOG_INAV                   (1<<14) // deprecated
-#define MASK_LOG_CAMERA                 (1<<15)
-#define MASK_LOG_MOTBATT                (1UL<<17)
-#define MASK_LOG_IMU_FAST               (1UL<<18)
+#define MASK_LOG_COMPASS                (1<<10)
+#define MASK_LOG_TECS                   (1<<11)
+#define MASK_LOG_CAMERA                 (1<<12)
+#define MASK_LOG_RC                     (1<<13)
+#define MASK_LOG_SONAR                  (1<<14)
+// #define MASK_LOG_ARM_DISARM             (1<<15)
 #define MASK_LOG_IMU_RAW                (1UL<<19)
-#define MASK_LOG_VIDEO_STABILISATION    (1UL<<20)
-#define MASK_LOG_ANY                    0xFFFF
+#define MASK_LOG_ATTITUDE_FULLRATE      (1U<<20)
+#define MASK_LOG_VIDEO_STABILISATION    (1UL<<21)
 
-// Radio failsafe definitions (FS_THR parameter)
-#define FS_THR_DISABLED                            0
-#define FS_THR_ENABLED_ALWAYS_RTL                  1
-#define FS_THR_ENABLED_CONTINUE_MISSION            2    // Removed in 4.0+, now use fs_options
-#define FS_THR_ENABLED_ALWAYS_LAND                 3
-#define FS_THR_ENABLED_ALWAYS_SMARTRTL_OR_RTL      4
-#define FS_THR_ENABLED_ALWAYS_SMARTRTL_OR_LAND     5
-#define FS_THR_ENABLED_AUTO_RTL_OR_RTL             6
+enum {
+    CRASH_DETECT_ACTION_BITMASK_DISABLED = 0,
+    CRASH_DETECT_ACTION_BITMASK_DISARM = (1<<0),
+    // note: next enum will be (1<<1), then (1<<2), then (1<<3)
+};
 
-// GCS failsafe definitions (FS_GCS_ENABLE parameter)
-#define FS_GCS_DISABLED                        0
-#define FS_GCS_ENABLED_ALWAYS_RTL              1
-#define FS_GCS_ENABLED_CONTINUE_MISSION        2    // Removed in 4.0+, now use fs_options
-#define FS_GCS_ENABLED_ALWAYS_SMARTRTL_OR_RTL  3
-#define FS_GCS_ENABLED_ALWAYS_SMARTRTL_OR_LAND 4
-#define FS_GCS_ENABLED_ALWAYS_LAND             5
-#define FS_GCS_ENABLED_AUTO_RTL_OR_RTL         6
+enum {
+    USE_REVERSE_THRUST_NEVER                    = 0,
+    USE_REVERSE_THRUST_AUTO_ALWAYS              = (1<<0),
+    USE_REVERSE_THRUST_AUTO_LAND_APPROACH       = (1<<1),
+    USE_REVERSE_THRUST_AUTO_LOITER_TO_ALT       = (1<<2),
+    USE_REVERSE_THRUST_AUTO_LOITER_ALL          = (1<<3),
+    USE_REVERSE_THRUST_AUTO_WAYPOINT            = (1<<4),
+    USE_REVERSE_THRUST_LOITER                   = (1<<5),
+    USE_REVERSE_THRUST_RTL                      = (1<<6),
+    USE_REVERSE_THRUST_CIRCLE                   = (1<<7),
+    USE_REVERSE_THRUST_CRUISE                   = (1<<8),
+    USE_REVERSE_THRUST_FBWB                     = (1<<9),
+    USE_REVERSE_THRUST_GUIDED                   = (1<<10),
+    USE_REVERSE_THRUST_AUTO_LANDING_PATTERN     = (1<<11),
+    USE_REVERSE_THRUST_FBWA                   = (1<<12),
+    USE_REVERSE_THRUST_ACRO                   = (1<<13),
+    USE_REVERSE_THRUST_STABILIZE            = (1<<14),
+    USE_REVERSE_THRUST_THERMAL             = (1<<15),
+};
 
-// EKF failsafe definitions (FS_EKF_ACTION parameter)
-#define FS_EKF_ACTION_LAND                  1       // switch to LAND mode on EKF failsafe
-#define FS_EKF_ACTION_ALTHOLD               2       // switch to ALTHOLD mode on EKF failsafe
-#define FS_EKF_ACTION_LAND_EVEN_STABILIZE   3       // switch to Land mode on EKF failsafe even if in a manual flight mode like stabilize
+enum FlightOptions {
+    DIRECT_RUDDER_ONLY   = (1 << 0),
+    CRUISE_TRIM_THROTTLE = (1 << 1),
+    DISABLE_TOFF_ATTITUDE_CHK = (1 << 2),
+    CRUISE_TRIM_AIRSPEED = (1 << 3),
+    CLIMB_BEFORE_TURN = (1 << 4),
+    ACRO_YAW_DAMPER = (1 << 5),
+    SURPRESS_TKOFF_SCALING = (1<<6),
+    ENABLE_DEFAULT_AIRSPEED = (1<<7),
+    GCS_REMOVE_TRIM_PITCH_CD = (1 << 8),
+    OSD_REMOVE_TRIM_PITCH_CD = (1 << 9),
+    CENTER_THROTTLE_TRIM = (1<<10),
+    DISABLE_GROUND_PID_SUPPRESSION = (1<<11),
+    ENABLE_LOITER_ALT_CONTROL = (1<<12),
 
-// for PILOT_THR_BHV parameter
-#define THR_BEHAVE_FEEDBACK_FROM_MID_STICK (1<<0)
-#define THR_BEHAVE_HIGH_THROTTLE_CANCELS_LAND (1<<1)
-#define THR_BEHAVE_DISARM_ON_LAND_DETECT (1<<2)
+};
+
+enum CrowFlapOptions {
+    FLYINGWING       = (1 << 0),
+    FULLSPAN         = (1 << 1),
+    PROGRESSIVE_CROW = (1 << 2),
+}; 
+
+
+enum guided_heading_type_t {
+    GUIDED_HEADING_NONE = 0, // no heading track
+    GUIDED_HEADING_COG,      // maintain ground track
+    GUIDED_HEADING_HEADING,  // maintain a heading
+};
+
+
+enum class AirMode {
+    OFF,
+    ON,
+    ASSISTED_FLIGHT_ONLY,
+};
+
+enum class FenceAutoEnable : uint8_t {
+    OFF=0,
+    Auto=1,
+    AutoDisableFloorOnly=2,
+    WhenArmed=3
+};

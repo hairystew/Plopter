@@ -5,7 +5,7 @@
 
 class GCS_Plopter : public GCS
 {
-    friend class Plopter; // for access to _chan in parameter declarations
+    friend class Plopter;  // for access to _chan in parameter declarations
 
 public:
 
@@ -25,33 +25,20 @@ public:
         return (GCS_MAVLINK_Plopter *)_chan[ofs];
     }
 
-    void update_vehicle_sensor_status_flags(void) override;
-
-    uint32_t custom_mode() const override;
-    MAV_TYPE frame_type() const override;
-
-    const char* frame_string() const override;
-
-    bool vehicle_initialised() const override;
-
-    bool simple_input_active() const override;
-    bool supersimple_input_active() const override;
-
 protected:
 
     uint8_t sysid_this_mav() const override;
-
-    // minimum amount of time (in microseconds) that must remain in
-    // the main scheduler loop before we are allowed to send any
-    // mavlink messages.  We want to prioritise the main flight
-    // control loop over communications
-    uint16_t min_loop_time_remaining_for_message_send_us() const override {
-        return 250;
-    }
+    void update_vehicle_sensor_status_flags(void) override;
+    uint32_t custom_mode() const override;
+    MAV_TYPE frame_type() const override;
 
     GCS_MAVLINK_Plopter *new_gcs_mavlink_backend(GCS_MAVLINK_Parameters &params,
-                                                AP_HAL::UARTDriver &uart) override {
+                                               AP_HAL::UARTDriver &uart) override {
         return new GCS_MAVLINK_Plopter(params, uart);
     }
 
+    AP_GPS::GPS_Status min_status_for_gps_healthy() const override {
+        // NO_FIX simply excludes NO_GPS
+        return AP_GPS::GPS_OK_FIX_3D;
+    }
 };

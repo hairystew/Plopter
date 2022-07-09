@@ -26,6 +26,7 @@
 // fwd declarations to avoid include errors
 class AC_AttitudeControl;
 class AC_PosControl;
+class AC_LQRControl;
 
 class AP_AHRS_View
 {

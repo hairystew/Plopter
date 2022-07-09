@@ -2,8 +2,10 @@
 /// @brief	Motor control class for tailsitters and bicopters
 #pragma once
 
+
 #include <AP_Common/AP_Common.h>
 #include <AP_Math/AP_Math.h>
+#include <AP_Math/stewMath.h>
 #include <SRV_Channel/SRV_Channel.h>
 #include "AP_MotorsMulticopter.h"
 
@@ -13,6 +15,10 @@ public:
 
     /// Constructor
     AP_MotorsPlopter(uint16_t loop_rate, uint16_t speed_hz = AP_MOTORS_SPEED_DEFAULT);
+
+    //Takes in a thrust and tilt angle for left and right motors
+    void set_output(float thrust_left, float tilt_left, float thrust_right, float tilt_right);
+
 
     // init
     void init(motor_frame_class frame_class, motor_frame_type frame_type) override;
@@ -37,7 +43,7 @@ protected:
     // calculate motor outputs
     void output_armed_stabilizing() override;
 
-    const char* _get_frame_string() const override { return "TAILSITTER"; }
+    const char* _get_frame_string() const override { return "PLOPTER"; }
 
     // spin a motor at the pwm value specified
     void _output_test_seq(uint8_t motor_seq, int16_t pwm) override;
@@ -48,7 +54,7 @@ protected:
     float _tilt_right;  // -1..1
     float _thrust_left;  // 0..1
     float _thrust_right;  // 0..1
-
+    float mass = 1.30604;
     // Set by tailsitters using diskloading minumum outflow velocity limit
     float _external_min_throttle;
 

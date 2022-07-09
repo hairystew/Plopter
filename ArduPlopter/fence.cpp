@@ -5,7 +5,6 @@
 #if AC_FENCE == ENABLED
 
 // fence_check - ask fence library to check for breaches and initiate the response
-// called at 1hz
 void Plopter::fence_check()
 {
     const uint8_t orig_breaches = fence.get_breaches();
@@ -13,78 +12,130 @@ void Plopter::fence_check()
     // check for new breaches; new_breaches is bitmask of fence types breached
     const uint8_t new_breaches = fence.check();
 
-    // we still don't do anything when disarmed, but we do check for fence breaches.
-    // fence pre-arm check actually checks if any fence has been breached 
-    // that's not ever going to be true if we don't call check on AP_Fence while disarmed.
-    if (!motors->armed()) {
+    if (!fence.enabled()) {
+        // Switch back to the chosen control mode if still in
+        // GUIDED to the return point
+        switch(fence.get_action()) {
+            case AC_FENCE_ACTION_GUIDED:
+            case AC_FENCE_ACTION_GUIDED_THROTTLE_PASS:
+            case AC_FENCE_ACTION_RTL_AND_LAND:
+                if (plopter.control_mode_reason == ModeReason::FENCE_BREACHED &&
+                    control_mode->is_guided_mode()) {
+                    set_mode(*previous_mode, ModeReason::FENCE_RETURN_PREVIOUS_MODE);
+                }
+                break;
+            default:
+                // No returning to a previous mode, unless our action allows it
+                break;
+        }
         return;
     }
 
-    // if there is a new breach take action
-    if (new_breaches) {
+    // we still don't do anything when disarmed, but we do check for fence breaches.
+    // fence pre-arm check actually checks if any fence has been breached
+    // that's not ever going to be true if we don't call check on AP_Fence while disarmed
+    if (!arming.is_armed()) {
+        return;
+    }
 
-        if (!plopter.ap.land_complete) {
-            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "Fence Breached");
-        }
+    // Never trigger a fence breach in the final stage of landing
+    if (landing.is_expecting_impact()) {
+        return;
+    }
 
+    if (orig_breaches &&
+        (control_mode->is_guided_mode()
+        || control_mode == &mode_rtl || fence.get_action() == AC_FENCE_ACTION_REPORT_ONLY)) {
+        // we have already triggered, don't trigger again until the
+        // user disables/re-enables using the fence channel switch
+        return;
+    }
+    
+     if(new_breaches && plopter.is_flying()) {
+         GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "Fence Breached");
+     }
+
+    if (new_breaches || orig_breaches) {
         // if the user wants some kind of response and motors are armed
-        uint8_t fence_act = fence.get_action();
-        if (fence_act != AC_FENCE_ACTION_REPORT_ONLY ) {
-
-            // disarm immediately if we think we are on the ground or in a manual flight mode with zero throttle
-            // don't disarm if the high-altitude fence has been broken because it's likely the user has pulled their throttle to zero to bring it down
-            if (ap.land_complete || (flightmode->has_manual_throttle() && ap.throttle_zero && !failsafe.radio && ((fence.get_breaches() & AC_FENCE_TYPE_ALT_MAX)== 0))){
-                arming.disarm(AP_Arming::Method::FENCEBREACH);
-
+        const uint8_t fence_act = fence.get_action();
+        switch (fence_act) {
+        case AC_FENCE_ACTION_REPORT_ONLY:
+            break;
+        case AC_FENCE_ACTION_GUIDED:
+        case AC_FENCE_ACTION_GUIDED_THROTTLE_PASS:
+        case AC_FENCE_ACTION_RTL_AND_LAND:
+            if (fence_act == AC_FENCE_ACTION_RTL_AND_LAND) {
+                if (control_mode == &mode_auto &&
+                    mission.get_in_landing_sequence_flag() &&
+                    (g.rtl_autoland == RtlAutoland::RTL_THEN_DO_LAND_START ||
+                     g.rtl_autoland == RtlAutoland::RTL_IMMEDIATE_DO_LAND_START)) {
+                    // already landing
+                    return;
+                }
+                set_mode(mode_rtl, ModeReason::FENCE_BREACHED);
             } else {
+                set_mode(mode_guided, ModeReason::FENCE_BREACHED);
+            }
 
-                // if more than 100m outside the fence just force a land
-                if (fence.get_breach_distance(new_breaches) > AC_FENCE_GIVE_UP_DISTANCE) {
-                    set_mode(Mode::Number::LAND, ModeReason::FENCE_BREACHED);
+            Location loc;
+            if (fence.get_return_rally() != 0 || fence_act == AC_FENCE_ACTION_RTL_AND_LAND) {
+                loc = rally.calc_best_rally_or_home_location(current_loc, get_RTL_altitude_cm());
+            } else {
+                //return to fence return point, not a rally point
+                if (fence.get_return_altitude() > 0) {
+                    // fly to the return point using _retalt
+                    loc.alt = home.alt + 100.0f * fence.get_return_altitude();
+                } else if (fence.get_safe_alt_min() >= fence.get_safe_alt_max()) {
+                    // invalid min/max, use RTL_altitude
+                    loc.alt = home.alt + g.RTL_altitude_cm;
                 } else {
-                    switch (fence_act) {
-                    case AC_FENCE_ACTION_RTL_AND_LAND:
-                    default:
-                        // switch to RTL, if that fails then Land
-                        if (!set_mode(Mode::Number::RTL, ModeReason::FENCE_BREACHED)) {
-                            set_mode(Mode::Number::LAND, ModeReason::FENCE_BREACHED);
-                        }
-                        break;
-                    case AC_FENCE_ACTION_ALWAYS_LAND:
-                        // if always land option mode is specified, land
-                        set_mode(Mode::Number::LAND, ModeReason::FENCE_BREACHED);
-                        break;
-                    case AC_FENCE_ACTION_SMART_RTL:
-                        // Try SmartRTL, if that fails, RTL, if that fails Land
-                        if (!set_mode(Mode::Number::SMART_RTL, ModeReason::FENCE_BREACHED)) {
-                            if (!set_mode(Mode::Number::RTL, ModeReason::FENCE_BREACHED)) {
-                                set_mode(Mode::Number::LAND, ModeReason::FENCE_BREACHED);
-                            }
-                        }
-                        break;
-                    case AC_FENCE_ACTION_BRAKE:
-                        // Try Brake, if that fails Land
-                        if (!set_mode(Mode::Number::BRAKE, ModeReason::FENCE_BREACHED)) {
-                            set_mode(Mode::Number::LAND, ModeReason::FENCE_BREACHED);
-                        }
-                        break;
-                    case AC_FENCE_ACTION_SMART_RTL_OR_LAND:
-                        // Try SmartRTL, if that fails, Land
-                        if (!set_mode(Mode::Number::SMART_RTL, ModeReason::FENCE_BREACHED)) {
-                            set_mode(Mode::Number::LAND, ModeReason::FENCE_BREACHED);
-                        }
-                        break;
-                    }
+                    // fly to the return point, with an altitude half way between
+                    // min and max
+                    loc.alt = home.alt + 100.0f * (fence.get_safe_alt_min() + fence.get_safe_alt_max()) / 2;
+                }
+
+                Vector2l return_point;
+                if(fence.polyfence().get_return_point(return_point)) {
+                    loc.lat = return_point[0];
+                    loc.lng = return_point[1];
+                } else {
+                    // When no fence return point is found (ie. no inclusion fence uploaded, but exclusion is)
+                    // we fail to obtain a valid fence return point. In this case, home is considered a safe
+                    // return point.
+                    loc.lat = home.lat;
+                    loc.lng = home.lng;
                 }
             }
+
+            if (fence.get_action() != AC_FENCE_ACTION_RTL_AND_LAND) {
+                setup_terrain_target_alt(loc);
+                set_guided_WP(loc);
+            }
+
+            if (fence.get_action() == AC_FENCE_ACTION_GUIDED_THROTTLE_PASS) {
+                guided_throttle_passthru = true;
+            }
+            break;
         }
 
         AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_FENCE, LogErrorCode(new_breaches));
-
     } else if (orig_breaches) {
         // record clearing of breach
         AP::logger().Write_Error(LogErrorSubsystem::FAILSAFE_FENCE, LogErrorCode::ERROR_RESOLVED);
     }
+}
+
+bool Plopter::fence_stickmixing(void) const
+{
+    if (fence.enabled() &&
+        fence.get_breaches() &&
+        control_mode->is_guided_mode())
+    {
+        // don't mix in user input
+        return false;
+    }
+    // normal mixing rules
+    return true;
 }
 
 #endif

@@ -1,89 +1,115 @@
 #include "Plopter.h"
 
-//
-//  failsafe support
-//  Andrew Tridgell, December 2011
-//
-//  our failsafe strategy is to detect main loop lockup and disarm the motors
-//
+/*
+ *  failsafe support
+ *  Andrew Tridgell, December 2011
+ */
 
-static bool failsafe_enabled = false;
-static uint16_t failsafe_last_ticks;
-static uint32_t failsafe_last_timestamp;
-static bool in_failsafe;
+/*
+ *  our failsafe strategy is to detect main loop lockup and switch to
+ *  passing inputs straight from the RC inputs to RC outputs.
+ */
 
-//
-// failsafe_enable - enable failsafe
-//
-void Plopter::failsafe_enable()
+/*
+ *  this failsafe_check function is called from the core timer interrupt
+ *  at 1kHz.
+ */
+void Plopter::failsafe_check(void)
 {
-    failsafe_enabled = true;
-    failsafe_last_timestamp = micros();
-}
-
-//
-// failsafe_disable - used when we know we are going to delay the mainloop significantly
-//
-void Plopter::failsafe_disable()
-{
-    failsafe_enabled = false;
-}
-
-//
-//  failsafe_check - this function is called from the core timer interrupt at 1kHz.
-//
-void Plopter::failsafe_check()
-{
-    uint32_t tnow = AP_HAL::micros();
+    static uint16_t last_ticks;
+    static uint32_t last_timestamp;
+    static bool in_failsafe;
+    uint32_t tnow = micros();
 
     const uint16_t ticks = scheduler.ticks();
-    if (ticks != failsafe_last_ticks) {
+    if (ticks != last_ticks) {
         // the main loop is running, all is OK
-        failsafe_last_ticks = ticks;
-        failsafe_last_timestamp = tnow;
-        if (in_failsafe) {
-            in_failsafe = false;
-            AP::logger().Write_Error(LogErrorSubsystem::CPU, LogErrorCode::FAILSAFE_RESOLVED);
-        }
+        last_ticks = ticks;
+        last_timestamp = tnow;
+        in_failsafe = false;
         return;
     }
 
-    if (!in_failsafe && failsafe_enabled && tnow - failsafe_last_timestamp > 2000000) {
-        // motors are running but we have gone 2 second since the
-        // main loop ran. That means we're in trouble and should
-        // disarm the motors->
+    if (tnow - last_timestamp > 200000) {
+        // we have gone at least 0.2 seconds since the main loop
+        // ran. That means we're in trouble, or perhaps are in
+        // an initialisation routine or log erase. Start passing RC
+        // inputs through to outputs
         in_failsafe = true;
-        // reduce motors to minimum (we do not immediately disarm because we want to log the failure)
-        if (motors->armed()) {
-            motors->output_min();
-        }
-
-        AP::logger().Write_Error(LogErrorSubsystem::CPU, LogErrorCode::FAILSAFE_OCCURRED);
     }
 
-    if (failsafe_enabled && in_failsafe && tnow - failsafe_last_timestamp > 1000000) {
-        // disarm motors every second
-        failsafe_last_timestamp = tnow;
-        if(motors->armed()) {
-            motors->armed(false);
-            motors->output();
-        }
-    }
-}
+    if (in_failsafe && tnow - last_timestamp > 20000) {
 
+        // ensure we have the latest RC inputs
+        rc().read_input();
+
+        last_timestamp = tnow;
+
+        rc().read_input();
 
 #if ADVANCED_FAILSAFE == ENABLED
-/*
-  check for AFS failsafe check
-*/
-void Plopter::afs_fs_check(void)
-{
-    // perform AFS failsafe checks
-#if AC_FENCE
-    const bool fence_breached = fence.get_breaches() != 0;
-#else
-    const bool fence_breached = false;
+        if (in_calibration) {
+            // tell the failsafe system that we are calibrating
+            // sensors, so don't trigger failsafe
+            afs.heartbeat();
+        }
 #endif
-    g2.afs.check(fence_breached, last_radio_update_ms);
+
+        if (RC_Channels::get_valid_channel_count() < 5) {
+            // we don't have any RC input to pass through
+            return;
+        }
+
+        // pass RC inputs to outputs every 20ms
+        RC_Channels::clear_overrides();
+
+        float roll = roll_in_expo(false);
+        float pitch = pitch_in_expo(false);
+        float throttle = get_throttle_input(true);
+        float rudder = rudder_in_expo(false);
+
+        if (!hal.util->get_soft_armed()) {
+            throttle = 0;
+        }
+        
+        // setup secondary output channels that don't have
+        // corresponding input channels
+        SRV_Channels::set_output_scaled(SRV_Channel::k_aileron, roll);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_elevator, pitch);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_rudder, rudder);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_steering, rudder);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, throttle);
+
+        // this is to allow the failsafe module to deliberately crash 
+        // the plopter. Only used in extreme circumstances to meet the
+        // OBC rules
+#if ADVANCED_FAILSAFE == ENABLED
+        if (afs.should_crash_vehicle()) {
+            afs.terminate_vehicle();
+            if (!afs.terminating_vehicle_via_landing()) {
+                return;
+            }
+        }
+#endif
+
+        // setup secondary output channels that do have
+        // corresponding input channels
+        SRV_Channels::copy_radio_in_out(SRV_Channel::k_manual, true);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_flap, 0.0);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_flap_auto, 0.0);
+
+        // setup flaperons
+        flaperon_update();
+
+        servos_output();
+
+        // in SITL we send through the servo outputs so we can verify
+        // we're manipulating surfaces
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+        GCS_MAVLINK *chan = gcs().chan(0);
+        if (HAVE_PAYLOAD_SPACE(chan->get_chan(), SERVO_OUTPUT_RAW)) {
+            chan->send_servo_output_raw();
+        }
+#endif
+    }
 }
-#endif

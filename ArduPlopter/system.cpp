@@ -1,5 +1,6 @@
 #include "Plopter.h"
-#include <AP_ESC_Telem/AP_ESC_Telem.h>
+
+#include "qautotune.h"
 
 /*****************************************************************************
 *   The init_ardupilot function processes everything we need for an in - air restart
@@ -21,39 +22,55 @@ void Plopter::init_ardupilot()
     g2.stats.init();
 #endif
 
+    ins.set_log_raw_bit(MASK_LOG_IMU_RAW);
+
+    // setup any board specific drivers
     BoardConfig.init();
+
 #if HAL_MAX_CAN_PROTOCOL_DRIVERS
     can_mgr.init();
 #endif
 
-    // init cargo gripper
-#if GRIPPER_ENABLED == ENABLED
-    g2.gripper.init();
-#endif
+    rollController.convert_pid();
+    pitchController.convert_pid();
 
-#if AC_FENCE == ENABLED
-    fence.init();
+    // initialise rc channels including setting mode
+#if HAL_QUADPLANE_ENABLED
+    rc().convert_options(RC_Channel::AUX_FUNC::ARMDISARM_UNUSED, (quadplopter.enabled() && (quadplopter.options & QuadPlopter::OPTION_AIRMODE_UNUSED) && (rc().find_channel_for_option(RC_Channel::AUX_FUNC::AIRMODE) == nullptr)) ? RC_Channel::AUX_FUNC::ARMDISARM_AIRMODE : RC_Channel::AUX_FUNC::ARMDISARM);
+#else
+    rc().convert_options(RC_Channel::AUX_FUNC::ARMDISARM_UNUSED, RC_Channel::AUX_FUNC::ARMDISARM);
 #endif
+    rc().init();
 
-    // init winch
-#if WINCH_ENABLED == ENABLED
-    g2.winch.init();
-#endif
+    relay.init();
 
     // initialise notify system
     notify.init();
-    notify_flight_mode();
+    notify_mode(*control_mode);
 
-    // initialise battery monitor
+    init_rc_out_main();
+    
+    // keep a record of how many resets have happened. This can be
+    // used to detect in-flight resets
+    g.num_resets.set_and_save(g.num_resets+1);
+
+    // init baro
+    barometer.init();
+
+    // initialise rangefinder
+    rangefinder.set_log_rfnd_bit(MASK_LOG_SONAR);
+    rangefinder.init(ROTATION_PITCH_270);
+
+    // initialise battery monitoring
     battery.init();
 
-    // Init RSSI
     rssi.init();
 
-    barometer.init();
+    rpm_sensor.init();
 
     // setup telem slots with serial ports
     gcs().setup_uarts();
+
 
 #if OSD_ENABLED == ENABLED
     osd.init();
@@ -63,51 +80,6 @@ void Plopter::init_ardupilot()
     log_init();
 #endif
 
-    // update motor interlock state
-    update_using_interlock();
-
-#if FRAME_CONFIG == HELI_FRAME
-    // trad heli specific initialisation
-    heli_init();
-#endif
-#if FRAME_CONFIG == HELI_FRAME
-    input_manager.set_loop_rate(scheduler.get_loop_rate_hz());
-#endif
-
-    init_rc_in();               // sets up rc channels from radio
-
-    // initialise surface to be tracked in SurfaceTracking
-    // must be before rc init to not override inital switch position
-    surface_tracking.init((SurfaceTracking::Surface)plopter.g2.surftrak_mode.get());
-
-    // allocate the motors class
-    allocate_motors();
-
-    // initialise rc channels including setting mode
-    rc().convert_options(RC_Channel::AUX_FUNC::ARMDISARM_UNUSED, RC_Channel::AUX_FUNC::ARMDISARM_AIRMODE);
-    rc().init();
-
-    // sets up motors and output to escs
-    init_rc_out();
-
-    // check if we should enter esc calibration mode
-    esc_calibration_startup_check();
-
-    // motors initialised so parameters can be sent
-    ap.initialised_params = true;
-
-    relay.init();
-
-    /*
-     *  setup the 'main loop is dead' check. Note that this relies on
-     *  the RC library being initialised.
-     */
-    hal.scheduler->register_timer_failsafe(failsafe_check_static, 1000);
-
-    // Do GPS init
-    gps.set_log_gps_bit(MASK_LOG_GPS);
-    gps.init(serial_manager);
-
     AP::compass().set_log_bit(MASK_LOG_COMPASS);
     AP::compass().init();
 
@@ -115,240 +87,334 @@ void Plopter::init_ardupilot()
     airspeed.set_log_bit(MASK_LOG_IMU);
 #endif
 
-#if AC_OAPATHPLANNER_ENABLED == ENABLED
-    g2.oa.init();
-#endif
+    // GPS Initialization
+    gps.set_log_gps_bit(MASK_LOG_GPS);
+    gps.init(serial_manager);
 
-    attitude_control->parameter_sanity_check();
-
-#if AP_OPTICALFLOW_ENABLED
-    // initialise optical flow sensor
-    optflow.init(MASK_LOG_OPTFLOW);
-#endif      // AP_OPTICALFLOW_ENABLED
+    init_rc_in();               // sets up rc channels from radio
 
 #if HAL_MOUNT_ENABLED
     // initialise camera mount
     camera_mount.init();
 #endif
 
-#if PRECISION_LANDING == ENABLED
-    // initialise precision landing
-    init_precland();
-#endif
-
 #if LANDING_GEAR_ENABLED == ENABLED
     // initialise landing gear position
-    landinggear.init();
+    g2.landing_gear.init();
 #endif
 
-#ifdef USERHOOK_INIT
-    USERHOOK_INIT
+#if FENCE_TRIGGERED_PIN > 0
+    hal.gpio->pinMode(FENCE_TRIGGERED_PIN, HAL_GPIO_OUTPUT);
+    hal.gpio->write(FENCE_TRIGGERED_PIN, 0);
 #endif
 
-    // read Baro pressure at ground
-    //-----------------------------
-    barometer.set_log_baro_bit(MASK_LOG_IMU);
-    barometer.calibrate();
+    /*
+     *  setup the 'main loop is dead' check. Note that this relies on
+     *  the RC library being initialised.
+     */
+    hal.scheduler->register_timer_failsafe(failsafe_check_static, 1000);
 
-    // initialise rangefinder
-    init_rangefinder();
-
-#if HAL_PROXIMITY_ENABLED
-    // init proximity sensor
-    g2.proximity.init();
+#if HAL_QUADPLANE_ENABLED
+    quadplopter.setup();
 #endif
 
-#if BEACON_ENABLED == ENABLED
-    // init beacons used for non-gps position estimation
-    g2.beacon.init();
+    AP_Param::reload_defaults_file(true);
+    
+    startup_ground();
+
+    // don't initialise aux rc output until after quadplopter is setup as
+    // that can change initial values of channels
+    init_rc_out_aux();
+
+    if (g2.oneshot_mask != 0) {
+        hal.rcout->set_output_mode(g2.oneshot_mask, AP_HAL::RCOutput::MODE_PWM_ONESHOT);
+    }
+
+    set_mode_by_number((enum Mode::Number)g.initial_mode.get(), ModeReason::INITIALISED);
+
+    // set the correct flight mode
+    // ---------------------------
+    reset_control_switch();
+
+    // initialise sensor
+#if AP_OPTICALFLOW_ENABLED
+    if (optflow.enabled()) {
+        optflow.init(-1);
+    }
 #endif
 
-#if RPM_ENABLED == ENABLED
-    // initialise AP_RPM library
-    rpm_sensor.init();
+// init cargo gripper
+#if GRIPPER_ENABLED == ENABLED
+    g2.gripper.init();
 #endif
 
-#if MODE_AUTO_ENABLED == ENABLED
+    // init fence
+#if AC_FENCE == ENABLED
+    fence.init();
+#endif
+}
+
+//********************************************************************************
+//This function does all the calibrations, etc. that we need during a ground start
+//********************************************************************************
+void Plopter::startup_ground(void)
+{
+    set_mode(mode_initializing, ModeReason::INITIALISED);
+
+#if (GROUND_START_DELAY > 0)
+    gcs().send_text(MAV_SEVERITY_NOTICE,"Ground start with delay");
+    delay(GROUND_START_DELAY * 1000);
+#else
+    gcs().send_text(MAV_SEVERITY_INFO,"Ground start");
+#endif
+
+    //INS ground start
+    //------------------------
+    //
+    startup_INS_ground();
+
+    // Save the settings for in-air restart
+    // ------------------------------------
+    //save_EEPROM_groundstart();
+
     // initialise mission library
-    mode_auto.mission.init();
-#endif
-
-#if MODE_SMARTRTL_ENABLED == ENABLED
-    // initialize SmartRTL
-    g2.smart_rtl.init();
-#endif
+    mission.init();
 
     // initialise AP_Logger library
-    logger.setVehicle_Startup_Writer(FUNCTOR_BIND(&plopter, &Plopter::Log_Write_Vehicle_Startup_Messages, void));
-
-    startup_INS_ground();
+#if LOGGING_ENABLED == ENABLED
+    logger.setVehicle_Startup_Writer(
+        FUNCTOR_BIND(&plopter, &Plopter::Log_Write_Vehicle_Startup_Messages, void)
+        );
+#endif
 
 #if AP_SCRIPTING_ENABLED
     g2.scripting.init();
 #endif // AP_SCRIPTING_ENABLED
 
-    // set landed flags
-    set_land_complete(true);
-    set_land_complete_maybe(true);
+    // reset last heartbeat time, so we don't trigger failsafe on slow
+    // startup
+    gcs().sysid_myggcs_seen(AP_HAL::millis());
 
     // we don't want writes to the serial port to cause us to pause
     // mid-flight, so set the serial ports non-blocking once we are
     // ready to fly
     serial_manager.set_blocking_writes_all(false);
-
-    // enable CPU failsafe
-    failsafe_enable();
-
-    ins.set_log_raw_bit(MASK_LOG_IMU_RAW);
-
-    // enable output to motors
-    if (arming.rc_calibration_checks(true)) {
-        enable_motor_output();
-    }
-
-    // attempt to set the intial_mode, else set to STABILIZE
-    if (!set_mode((enum Mode::Number)g.initial_mode.get(), ModeReason::INITIALISED)) {
-        // set mode to STABILIZE will trigger mode change notification to pilot
-        set_mode(Mode::Number::STABILIZE, ModeReason::UNAVAILABLE);
-    }
-
-    // flag that initialisation has completed
-    ap.initialised = true;
 }
 
 
-//******************************************************************************
-//This function does all the calibrations, etc. that we need during a ground start
-//******************************************************************************
-void Plopter::startup_INS_ground()
+bool Plopter::set_mode(Mode &new_mode, const ModeReason reason)
 {
-    // initialise ahrs (may push imu calibration into the mpu6000 if using that device).
+    // update last reason
+    const ModeReason last_reason = _last_reason;
+    _last_reason = reason;
+
+    if (control_mode == &new_mode) {
+        // don't switch modes if we are already in the correct mode.
+        // only make happy noise if using a difent method to switch, this stops beeping for repeated change mode requests from GCS
+        if ((reason != last_reason) && (reason != ModeReason::INITIALISED)) {
+            AP_Notify::events.user_mode_change = 1;
+        }
+        return true;
+    }
+
+#if HAL_QUADPLANE_ENABLED
+    if (new_mode.is_vtol_mode() && !plopter.quadplopter.available()) {
+        // dont try and switch to a Q mode if quadplopter is not enabled and initalized
+        gcs().send_text(MAV_SEVERITY_INFO,"Q_ENABLE 0");
+        // make sad noise
+        if (reason != ModeReason::INITIALISED) {
+            AP_Notify::events.user_mode_change_failed = 1;
+        }
+        return false;
+    }
+
+#if !QAUTOTUNE_ENABLED
+    if (&new_mode == &plopter.mode_qautotune) {
+        gcs().send_text(MAV_SEVERITY_INFO,"QAUTOTUNE disabled");
+        set_mode(plopter.mode_qhover, ModeReason::UNAVAILABLE);
+        // make sad noise
+        if (reason != ModeReason::INITIALISED) {
+            AP_Notify::events.user_mode_change_failed = 1;
+        }
+        return false;
+    }
+#endif  // !QAUTOTUNE_ENABLED
+
+#else
+    if (new_mode.is_vtol_mode()) {
+        INTERNAL_ERROR(AP_InternalError::error_t::flow_of_control);
+        gcs().send_text(MAV_SEVERITY_INFO,"HAL_QUADPLANE_ENABLED=0");
+        // make sad noise
+        if (reason != ModeReason::INITIALISED) {
+            AP_Notify::events.user_mode_change_failed = 1;
+        }
+        return false;
+    }
+#endif  // HAL_QUADPLANE_ENABLED
+
+    // backup current control_mode and previous_mode
+    Mode &old_previous_mode = *previous_mode;
+    Mode &old_mode = *control_mode;
+
+    // update control_mode assuming success
+    // TODO: move these to be after enter() once start_command_callback() no longer checks control_mode
+    previous_mode = control_mode;
+    control_mode = &new_mode;
+    const ModeReason previous_mode_reason = control_mode_reason;
+    control_mode_reason = reason;
+
+    // attempt to enter new mode
+    if (!new_mode.enter()) {
+        // Log error that we failed to enter desired flight mode
+        gcs().send_text(MAV_SEVERITY_WARNING, "Flight mode change failed");
+
+        // we failed entering new mode, roll back to old
+        previous_mode = &old_previous_mode;
+        control_mode = &old_mode;
+        control_mode_reason = previous_mode_reason;
+
+        // make sad noise
+        if (reason != ModeReason::INITIALISED) {
+            AP_Notify::events.user_mode_change_failed = 1;
+        }
+        return false;
+    }
+
+    if (previous_mode == &mode_autotune) {
+        // restore last gains
+        autotune_restore();
+    }
+
+    // exit previous mode
+    old_mode.exit();
+
+    // record reasons
+    control_mode_reason = reason;
+
+    // log and notify mode change
+    logger.Write_Mode(control_mode->mode_number(), control_mode_reason);
+    notify_mode(*control_mode);
+    gcs().send_message(MSG_HEARTBEAT);
+
+    // make happy noise
+    if (reason != ModeReason::INITIALISED) {
+        AP_Notify::events.user_mode_change = 1;
+    }
+    return true;
+}
+
+bool Plopter::set_mode(const uint8_t new_mode, const ModeReason reason)
+{
+    static_assert(sizeof(Mode::Number) == sizeof(new_mode), "The new mode can't be mapped to the vehicles mode number");
+
+    return set_mode_by_number(static_cast<Mode::Number>(new_mode), reason);
+}
+
+bool Plopter::set_mode_by_number(const Mode::Number new_mode_number, const ModeReason reason)
+{
+    Mode *new_mode = plopter.mode_from_mode_num(new_mode_number);
+    if (new_mode == nullptr) {
+        notify_no_such_mode(new_mode_number);
+        return false;
+    }
+    return set_mode(*new_mode, reason);
+}
+
+void Plopter::check_long_failsafe()
+{
+    const uint32_t gcs_last_seen_ms = gcs().sysid_myggcs_last_seen_time_ms();
+    const uint32_t tnow = millis();
+    // only act on changes
+    // -------------------
+    if (failsafe.state != FAILSAFE_LONG && failsafe.state != FAILSAFE_GCS && flight_stage != AP_Vehicle::FixedWing::FLIGHT_LAND) {
+        uint32_t radio_timeout_ms = failsafe.last_valid_rc_ms;
+        if (failsafe.state == FAILSAFE_SHORT) {
+            // time is relative to when short failsafe enabled
+            radio_timeout_ms = failsafe.short_timer_ms;
+        }
+        if (failsafe.rc_failsafe &&
+            (tnow - radio_timeout_ms) > g.fs_timeout_long*1000) {
+            failsafe_long_on_event(FAILSAFE_LONG, ModeReason::RADIO_FAILSAFE);
+        } else if (g.gcs_heartbeat_fs_enabled == GCS_FAILSAFE_HB_AUTO && control_mode == &mode_auto &&
+                   gcs_last_seen_ms != 0 &&
+                   (tnow - gcs_last_seen_ms) > g.fs_timeout_long*1000) {
+            failsafe_long_on_event(FAILSAFE_GCS, ModeReason::GCS_FAILSAFE);
+        } else if ((g.gcs_heartbeat_fs_enabled == GCS_FAILSAFE_HEARTBEAT ||
+                    g.gcs_heartbeat_fs_enabled == GCS_FAILSAFE_HB_RSSI) &&
+                   gcs_last_seen_ms != 0 &&
+                   (tnow - gcs_last_seen_ms) > g.fs_timeout_long*1000) {
+            failsafe_long_on_event(FAILSAFE_GCS, ModeReason::GCS_FAILSAFE);
+        } else if (g.gcs_heartbeat_fs_enabled == GCS_FAILSAFE_HB_RSSI && 
+                   gcs().chan(0) != nullptr &&
+                   gcs().chan(0)->last_radio_status_remrssi_ms() != 0 &&
+                   (tnow - gcs().chan(0)->last_radio_status_remrssi_ms()) > g.fs_timeout_long*1000) {
+            failsafe_long_on_event(FAILSAFE_GCS, ModeReason::GCS_FAILSAFE);
+        }
+    } else {
+        uint32_t timeout_seconds = g.fs_timeout_long;
+        if (g.fs_action_short != FS_ACTION_SHORT_DISABLED) {
+            // avoid dropping back into short timeout
+            timeout_seconds = g.fs_timeout_short;
+        }
+        // We do not change state but allow for user to change mode
+        if (failsafe.state == FAILSAFE_GCS && 
+            (tnow - gcs_last_seen_ms) < timeout_seconds*1000) {
+            failsafe_long_off_event(ModeReason::GCS_FAILSAFE);
+        } else if (failsafe.state == FAILSAFE_LONG && 
+                   !failsafe.rc_failsafe) {
+            failsafe_long_off_event(ModeReason::RADIO_FAILSAFE);
+        }
+    }
+}
+
+void Plopter::check_short_failsafe()
+{
+    // only act on changes
+    // -------------------
+    if (g.fs_action_short != FS_ACTION_SHORT_DISABLED &&
+       failsafe.state == FAILSAFE_NONE &&
+       flight_stage != AP_Vehicle::FixedWing::FLIGHT_LAND) {
+        // The condition is checked and the flag rc_failsafe is set in radio.cpp
+        if(failsafe.rc_failsafe) {
+            failsafe_short_on_event(FAILSAFE_SHORT, ModeReason::RADIO_FAILSAFE);
+        }
+    }
+
+    if(failsafe.state == FAILSAFE_SHORT) {
+        if(!failsafe.rc_failsafe || g.fs_action_short == FS_ACTION_SHORT_DISABLED) {
+            failsafe_short_off_event(ModeReason::RADIO_FAILSAFE);
+        }
+    }
+}
+
+
+void Plopter::startup_INS_ground(void)
+{
+    if (ins.gyro_calibration_timing() != AP_InertialSensor::GYRO_CAL_NEVER) {
+        gcs().send_text(MAV_SEVERITY_ALERT, "Beginning INS calibration. Do not move plopter");
+    } else {
+        gcs().send_text(MAV_SEVERITY_ALERT, "Skipping INS calibration");
+    }
+
     ahrs.init();
-    ahrs.set_vehicle_class(AP_AHRS::VehicleClass::COPTER);
+    ahrs.set_fly_forward(true);
+    ahrs.set_vehicle_class(AP_AHRS::VehicleClass::FIXED_WING);
+    ahrs.set_wind_estimation_enabled(true);
 
-    // Warm up and calibrate gyro offsets
     ins.init(scheduler.get_loop_rate_hz());
-
-    // reset ahrs including gyro bias
     ahrs.reset();
+
+    // read Baro pressure at ground
+    //-----------------------------
+    barometer.set_log_baro_bit(MASK_LOG_IMU);
+    barometer.calibrate();
 }
 
-// position_ok - returns true if the horizontal absolute position is ok and home position is set
-bool Plopter::position_ok() const
+// sets notify object flight mode information
+void Plopter::notify_mode(const Mode& mode)
 {
-    // return false if ekf failsafe has triggered
-    if (failsafe.ekf) {
-        return false;
-    }
-
-    // check ekf position estimate
-    return (ekf_has_absolute_position() || ekf_has_relative_position());
-}
-
-// ekf_has_absolute_position - returns true if the EKF can provide an absolute WGS-84 position estimate
-bool Plopter::ekf_has_absolute_position() const
-{
-    if (!ahrs.have_inertial_nav()) {
-        // do not allow navigation with dcm position
-        return false;
-    }
-
-    // with EKF use filter status and ekf check
-    nav_filter_status filt_status = inertial_nav.get_filter_status();
-
-    // if disarmed we accept a predicted horizontal position
-    if (!motors->armed()) {
-        return ((filt_status.flags.horiz_pos_abs || filt_status.flags.pred_horiz_pos_abs));
-    } else {
-        // once armed we require a good absolute position and EKF must not be in const_pos_mode
-        return (filt_status.flags.horiz_pos_abs && !filt_status.flags.const_pos_mode);
-    }
-}
-
-// ekf_has_relative_position - returns true if the EKF can provide a position estimate relative to it's starting position
-bool Plopter::ekf_has_relative_position() const
-{
-    // return immediately if EKF not used
-    if (!ahrs.have_inertial_nav()) {
-        return false;
-    }
-
-    // return immediately if neither optflow nor visual odometry is enabled and dead reckoning is inactive
-    bool enabled = false;
-#if AP_OPTICALFLOW_ENABLED
-    if (optflow.enabled()) {
-        enabled = true;
-    }
-#endif
-#if HAL_VISUALODOM_ENABLED
-    if (visual_odom.enabled()) {
-        enabled = true;
-    }
-#endif
-    if (dead_reckoning.active && !dead_reckoning.timeout) {
-        enabled = true;
-    }
-    if (!enabled) {
-        return false;
-    }
-
-    // get filter status from EKF
-    nav_filter_status filt_status = inertial_nav.get_filter_status();
-
-    // if disarmed we accept a predicted horizontal relative position
-    if (!motors->armed()) {
-        return (filt_status.flags.pred_horiz_pos_rel);
-    } else {
-        return (filt_status.flags.horiz_pos_rel && !filt_status.flags.const_pos_mode);
-    }
-}
-
-// returns true if the ekf has a good altitude estimate (required for modes which do AltHold)
-bool Plopter::ekf_alt_ok() const
-{
-    if (!ahrs.have_inertial_nav()) {
-        // do not allow alt control with only dcm
-        return false;
-    }
-
-    // with EKF use filter status and ekf check
-    nav_filter_status filt_status = inertial_nav.get_filter_status();
-
-    // require both vertical velocity and position
-    return (filt_status.flags.vert_vel && filt_status.flags.vert_pos);
-}
-
-// update_auto_armed - update status of auto_armed flag
-void Plopter::update_auto_armed()
-{
-    // disarm checks
-    if(ap.auto_armed){
-        // if motors are disarmed, auto_armed should also be false
-        if(!motors->armed()) {
-            set_auto_armed(false);
-            return;
-        }
-        // if in stabilize or acro flight mode and throttle is zero, auto-armed should become false
-        if(flightmode->has_manual_throttle() && ap.throttle_zero && !failsafe.radio) {
-            set_auto_armed(false);
-        }
-
-    }else{
-        // arm checks
-
-        // for tradheli if motors are armed and throttle is above zero and the motor is started, auto_armed should be true
-        if(motors->armed() && ap.using_interlock) {
-            if(!ap.throttle_zero && motors->get_spool_state() == AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
-                set_auto_armed(true);
-            }
-            // if motors are armed and throttle is above zero auto_armed should be true
-            // if motors are armed and we are in throw mode, then auto_armed should be true
-        } else if (motors->armed() && !ap.using_interlock) {
-            if(!ap.throttle_zero || flightmode->mode_number() == Mode::Number::THROW) {
-                set_auto_armed(true);
-            }
-        }
-    }
+    notify.flags.flight_mode = mode.mode_number();
+    notify.set_flight_mode_str(mode.name4());
 }
 
 /*
@@ -357,7 +423,6 @@ void Plopter::update_auto_armed()
 bool Plopter::should_log(uint32_t mask)
 {
 #if LOGGING_ENABLED == ENABLED
-    ap.logging_started = logger.logging_started();
     return logger.should_log(mask);
 #else
     return false;
@@ -365,176 +430,18 @@ bool Plopter::should_log(uint32_t mask)
 }
 
 /*
-  allocate the motors class
+  return throttle percentage from 0 to 100 for normal use and -100 to 100 when using reverse thrust
  */
-void Plopter::allocate_motors(void)
+int8_t Plopter::throttle_percentage(void)
 {
-    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
-#if FRAME_CONFIG != HELI_FRAME
-        case AP_Motors::MOTOR_FRAME_QUAD:
-        case AP_Motors::MOTOR_FRAME_HEXA:
-        case AP_Motors::MOTOR_FRAME_Y6:
-        case AP_Motors::MOTOR_FRAME_OCTA:
-        case AP_Motors::MOTOR_FRAME_OCTAQUAD:
-        case AP_Motors::MOTOR_FRAME_DODECAHEXA:
-        case AP_Motors::MOTOR_FRAME_DECA:
-        case AP_Motors::MOTOR_FRAME_SCRIPTING_MATRIX:
-        default:
-            motors = new AP_MotorsMatrix(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsMatrix::var_info;
-            break;
-        case AP_Motors::MOTOR_FRAME_TRI:
-            motors = new AP_MotorsTri(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsTri::var_info;
-            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_TRICOPTER);
-            break;
-        case AP_Motors::MOTOR_FRAME_SINGLE:
-            motors = new AP_MotorsSingle(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsSingle::var_info;
-            break;
-        case AP_Motors::MOTOR_FRAME_COAX:
-            motors = new AP_MotorsCoax(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsCoax::var_info;
-            break;
-        case AP_Motors::MOTOR_FRAME_TAILSITTER:
-            motors = new AP_MotorsTailsitter(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsTailsitter::var_info;
-            break;
-        case AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING:
-#if AP_SCRIPTING_ENABLED
-            motors = new AP_MotorsMatrix_6DoF_Scripting(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsMatrix_6DoF_Scripting::var_info;
-#endif // AP_SCRIPTING_ENABLED
-            break;
-        case AP_Motors::MOTOR_FRAME_DYNAMIC_SCRIPTING_MATRIX:
-#if AP_SCRIPTING_ENABLED
-            motors = new AP_MotorsMatrix_Scripting_Dynamic(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsMatrix_Scripting_Dynamic::var_info;
-#endif // AP_SCRIPTING_ENABLED
-            break;
-#else // FRAME_CONFIG == HELI_FRAME
-        case AP_Motors::MOTOR_FRAME_HELI_DUAL:
-            motors = new AP_MotorsHeli_Dual(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsHeli_Dual::var_info;
-            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
-            break;
-
-        case AP_Motors::MOTOR_FRAME_HELI_QUAD:
-            motors = new AP_MotorsHeli_Quad(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsHeli_Quad::var_info;
-            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
-            break;
-
-        case AP_Motors::MOTOR_FRAME_HELI:
-        default:
-            motors = new AP_MotorsHeli_Single(plopter.scheduler.get_loop_rate_hz());
-            motors_var_info = AP_MotorsHeli_Single::var_info;
-            AP_Param::set_frame_type_flags(AP_PARAM_FRAME_HELI);
-            break;
+#if HAL_QUADPLANE_ENABLED
+    if (quadplopter.in_vtol_mode() && !quadplopter.tailsitter.in_vtol_transition()) {
+        return quadplopter.motors->get_throttle_out() * 100.0;
+    }
 #endif
+    float throttle = SRV_Channels::get_output_scaled(SRV_Channel::k_throttle);
+    if (!have_reverse_thrust()) {
+        return constrain_int16(throttle, 0, 100);
     }
-    if (motors == nullptr) {
-        AP_BoardConfig::allocation_error("FRAME_CLASS=%u", (unsigned)g2.frame_class.get());
-    }
-    AP_Param::load_object_from_eeprom(motors, motors_var_info);
-
-    ahrs_view = ahrs.create_view(ROTATION_NONE);
-    if (ahrs_view == nullptr) {
-        AP_BoardConfig::allocation_error("AP_AHRS_View");
-    }
-
-    const struct AP_Param::GroupInfo *ac_var_info;
-
-#if FRAME_CONFIG != HELI_FRAME
-    if ((AP_Motors::motor_frame_class)g2.frame_class.get() == AP_Motors::MOTOR_FRAME_6DOF_SCRIPTING) {
-#if AP_SCRIPTING_ENABLED
-        //attitude_control = new AC_AttitudeControl_Multi_6DoF(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
-        //ac_var_info = AC_AttitudeControl_Multi_6DoF::var_info;
-        //I know I messed this up HRS
-#endif // AP_SCRIPTING_ENABLED
-    } else {
-        attitude_control = new AC_AttitudeControl_Multi(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
-        ac_var_info = AC_AttitudeControl_Multi::var_info;
-    }
-#else
-    attitude_control = new AC_AttitudeControl_Heli(*ahrs_view, aparm, *motors, scheduler.get_loop_period_s());
-    ac_var_info = AC_AttitudeControl_Heli::var_info;
-#endif
-    if (attitude_control == nullptr) {
-        AP_BoardConfig::allocation_error("AttitudeControl");
-    }
-    AP_Param::load_object_from_eeprom(attitude_control, ac_var_info);
-
-    pos_control = new AC_PosControl(*ahrs_view, inertial_nav, *motors, *attitude_control, scheduler.get_loop_period_s());
-    if (pos_control == nullptr) {
-        AP_BoardConfig::allocation_error("PosControl");
-    }
-    AP_Param::load_object_from_eeprom(pos_control, pos_control->var_info);
-
-#if AC_OAPATHPLANNER_ENABLED == ENABLED
-    wp_nav = new AC_WPNav_OA(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
-#else
-    wp_nav = new AC_WPNav(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
-#endif
-    if (wp_nav == nullptr) {
-        AP_BoardConfig::allocation_error("WPNav");
-    }
-    AP_Param::load_object_from_eeprom(wp_nav, wp_nav->var_info);
-
-    loiter_nav = new AC_Loiter(inertial_nav, *ahrs_view, *pos_control, *attitude_control);
-    if (loiter_nav == nullptr) {
-        AP_BoardConfig::allocation_error("LoiterNav");
-    }
-    AP_Param::load_object_from_eeprom(loiter_nav, loiter_nav->var_info);
-
-#if MODE_CIRCLE_ENABLED == ENABLED
-    circle_nav = new AC_Circle(inertial_nav, *ahrs_view, *pos_control);
-    if (circle_nav == nullptr) {
-        AP_BoardConfig::allocation_error("CircleNav");
-    }
-    AP_Param::load_object_from_eeprom(circle_nav, circle_nav->var_info);
-#endif
-
-    // reload lines from the defaults file that may now be accessible
-    AP_Param::reload_defaults_file(true);
-
-    // now setup some frame-class specific defaults
-    switch ((AP_Motors::motor_frame_class)g2.frame_class.get()) {
-        case AP_Motors::MOTOR_FRAME_Y6:
-            attitude_control->get_rate_roll_pid().kP().set_default(0.1);
-            attitude_control->get_rate_roll_pid().kD().set_default(0.006);
-            attitude_control->get_rate_pitch_pid().kP().set_default(0.1);
-            attitude_control->get_rate_pitch_pid().kD().set_default(0.006);
-            attitude_control->get_rate_yaw_pid().kP().set_default(0.15);
-            attitude_control->get_rate_yaw_pid().kI().set_default(0.015);
-            break;
-        case AP_Motors::MOTOR_FRAME_TRI:
-            attitude_control->get_rate_yaw_pid().filt_D_hz().set_default(100);
-            break;
-        default:
-            break;
-    }
-
-    // brushed 16kHz defaults to 16kHz pulses
-    if (motors->is_brushed_pwm_type()) {
-        g.rc_speed.set_default(16000);
-    }
-
-    // upgrade parameters. This must be done after allocating the objects
-    convert_pid_parameters();
-#if FRAME_CONFIG == HELI_FRAME
-    convert_tradheli_parameters();
-#endif
-
-    // param count could have changed
-    AP_Param::invalidate_count();
-}
-
-bool Plopter::is_tradheli() const
-{
-#if FRAME_CONFIG == HELI_FRAME
-    return true;
-#else
-    return false;
-#endif
+    return constrain_int16(throttle, -100, 100);
 }
