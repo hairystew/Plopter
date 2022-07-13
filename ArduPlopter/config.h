@@ -57,7 +57,7 @@
 // FLIGHT_MODE_CHANNEL
 //
 #ifndef FLIGHT_MODE_CHANNEL
- # define FLIGHT_MODE_CHANNEL    8
+ # define FLIGHT_MODE_CHANNEL    5
 #endif
 #if (FLIGHT_MODE_CHANNEL != 5) && (FLIGHT_MODE_CHANNEL != 6) && (FLIGHT_MODE_CHANNEL != 7) && (FLIGHT_MODE_CHANNEL != 8)
  # error XXX
@@ -66,22 +66,22 @@
 #endif
 
 #if !defined(FLIGHT_MODE_1)
- # define FLIGHT_MODE_1                  Mode::Number::RTL
+ # define FLIGHT_MODE_1                  Mode::Number::BABA
 #endif
 #if !defined(FLIGHT_MODE_2)
- # define FLIGHT_MODE_2                  Mode::Number::RTL
+ # define FLIGHT_MODE_2                  Mode::Number::BABA
 #endif
 #if !defined(FLIGHT_MODE_3)
- # define FLIGHT_MODE_3                  Mode::Number::FLY_BY_WIRE_A
+ # define FLIGHT_MODE_3                  Mode::Number::AUTO
 #endif
 #if !defined(FLIGHT_MODE_4)
- # define FLIGHT_MODE_4                  Mode::Number::FLY_BY_WIRE_A
+ # define FLIGHT_MODE_4                  Mode::Number::AUTO
 #endif
 #if !defined(FLIGHT_MODE_5)
- # define FLIGHT_MODE_5                  Mode::Number::MANUAL
+ # define FLIGHT_MODE_5                  Mode::Number::RTL
 #endif
 #if !defined(FLIGHT_MODE_6)
- # define FLIGHT_MODE_6                  Mode::Number::MANUAL
+ # define FLIGHT_MODE_6                  Mode::Number::RTL
 #endif
 
 

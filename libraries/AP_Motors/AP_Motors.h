@@ -13,4 +13,3 @@
 #include "AP_Motors6DOF.h"
 #include "AP_MotorsMatrix_6DoF_Scripting.h"
 #include "AP_MotorsMatrix_Scripting_Dynamic.h"
-#include "AP_MotorsPlopter.h"

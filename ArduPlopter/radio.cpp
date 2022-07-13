@@ -13,11 +13,14 @@ void Plopter::set_control_channels(void)
         // same.
         channel_roll = RC_Channels::rc_channel(rcmap.yaw()-1);
     } else {
-        channel_roll = RC_Channels::rc_channel(rcmap.roll()-1);
+        channel_roll = RC_Channels::rc_channel(1);
     }
-    channel_pitch    = RC_Channels::rc_channel(rcmap.pitch()-1);
-    channel_throttle = RC_Channels::rc_channel(rcmap.throttle()-1);
-    channel_rudder   = RC_Channels::rc_channel(rcmap.yaw()-1);
+//    channel_pitch    = RC_Channels::rc_channel(rcmap.pitch()-1);
+//    channel_throttle = RC_Channels::rc_channel(rcmap.throttle()-1);
+//    channel_rudder   = RC_Channels::rc_channel(rcmap.yaw()-1); HRS
+    channel_pitch    = RC_Channels::rc_channel(2);
+    channel_throttle = RC_Channels::rc_channel(0);
+    channel_rudder   = RC_Channels::rc_channel(3);
 
     // set rc channel ranges
     channel_roll->set_angle(SERVO_MAX);

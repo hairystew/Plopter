@@ -7,6 +7,7 @@
 #include <AP_ADSB/AP_ADSB.h>
 #include <AP_Vehicle/ModeReason.h>
 #include "quadplopter.h"
+#include <AP_Math/stewMath.h>
 
 class AC_PosControl;
 class AC_AttitudeControl_Multi;
@@ -726,6 +727,8 @@ class ModeBaba : public Mode
 {
 public:
 
+    ModeBaba();
+
     Number mode_number() const override { return Number::BABA; }
     const char *name() const override { return "BABA"; }
     const char *name4() const override { return "BABAmode_guided.cpp"; }
@@ -735,16 +738,20 @@ public:
 
     void navigate() override;
 
-    virtual bool is_guided_mode() const override { return true; }
-
-    bool allows_throttle_nudging() const override { return true; }
-
-    bool does_auto_navigation() const override { return true; }
-
+//    virtual bool is_guided_mode() const override { return true; }
+//
+    bool allows_throttle_nudging() const override { return false; }
+//
+    bool does_auto_navigation() const override { return false; }
+//
     bool does_auto_throttle() const override { return true; }
 
     // handle a guided target request from GCS
     bool handle_guided_request(Location target_loc) override;
+
+    // var_info for holding parameter information
+    static const struct AP_Param::GroupInfo var_info[];
+
 
 protected:
 
@@ -760,10 +767,14 @@ protected:
     float right_thrust = 0;
     float left_angle = 0;
     float right_angle = 0;
-    float mass = 1.30604; //kg just hardcoding this for now
+    float mass = 1.36604; //kg just hardcoding this for now
 
     Vector3f velVec;
     Vector3f relPosVec;
+
+    float left_accum = 0.;
+    float right_accum = 0.;
+
 
 
     bool _enter() override;

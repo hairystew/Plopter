@@ -263,16 +263,16 @@ namespace sm {
         unsigned m; //Cols
 
 
-        T& operator()(const unsigned& n, const unsigned& m) {
-            return this->data[n][m];
+        T& operator()(const unsigned& _n, const unsigned& _m) {
+            return this->data[_n][_m];
         }
 
-        const T& operator()(const unsigned& n, const unsigned& m) const{
-            return this->data[n][m];
+        const T& operator()(const unsigned& _n, const unsigned& _m) const{
+            return this->data[_n][_m];
         }
 
         //Initialize empty matrix
-        Matrix<T>() : n(0), m(0) {
+        Matrix<T>() : Matrix<T>(1) {
         }
 
 
@@ -330,6 +330,9 @@ namespace sm {
             }
             delete[] data;
 
+            n = rhs.n;
+            m = rhs.m;
+
             data = new T * [n];
             for (unsigned i = 0; i < n; ++i) {
                 data[i] = new T[m];
@@ -337,8 +340,6 @@ namespace sm {
                     data[i][j] = rhs(i, j);
                 }
             }
-            n = rhs.n;
-            m = rhs.m;
             return *this;
         }
 

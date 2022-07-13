@@ -1357,10 +1357,10 @@ void Plopter::load_parameters(void)
     AP_Param::convert_old_parameters(&conversion_table[0], ARRAY_SIZE(conversion_table));
 
     // setup defaults in SRV_Channels
-    g2.servo_channels.set_default_function(CH_1, SRV_Channel::k_aileron);
-    g2.servo_channels.set_default_function(CH_2, SRV_Channel::k_elevator);
-    g2.servo_channels.set_default_function(CH_3, SRV_Channel::k_throttle);
-    g2.servo_channels.set_default_function(CH_4, SRV_Channel::k_rudder);
+//    g2.servo_channels.set_default_function(CH_1, SRV_Channel::k_aileron);
+//    g2.servo_channels.set_default_function(CH_2, SRV_Channel::k_elevator);
+//    g2.servo_channels.set_default_function(CH_3, SRV_Channel::k_throttle);
+//    g2.servo_channels.set_default_function(CH_4, SRV_Channel::k_rudder);
         
     SRV_Channels::upgrade_parameters();
 
