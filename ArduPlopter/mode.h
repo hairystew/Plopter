@@ -769,8 +769,11 @@ protected:
     float right_angle = 0;
     float mass = 1.36604; //kg just hardcoding this for now
 
-    Vector3f velVec;
-    Vector3f relPosVec;
+    Vector3f velNED;
+    Vector3f relPosNED;
+    Vector3f velBody;
+    Vector3f relPosBody;
+    Quaternion attQuat;
 
     float left_accum = 0.;
     float right_accum = 0.;

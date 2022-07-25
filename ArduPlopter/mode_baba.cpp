@@ -44,54 +44,59 @@ forcing
 
 
 
+
+
+
+
+
     K_Gain_Matrix(0, 0) = 0.000000;
-    K_Gain_Matrix(0, 1) = -0.070711;
-    K_Gain_Matrix(0, 2) = -0.070711;
+    K_Gain_Matrix(0, 1) = -0.035355;
+    K_Gain_Matrix(0, 2) = -0.035355;
     K_Gain_Matrix(0, 3) = 0.000000;
-    K_Gain_Matrix(0, 4) = -0.243125;
-    K_Gain_Matrix(0, 5) = -0.250088;
-    K_Gain_Matrix(0, 6) = -0.631922;
-    K_Gain_Matrix(0, 7) = 0.000000;
+    K_Gain_Matrix(0, 4) = -0.128550;
+    K_Gain_Matrix(0, 5) = -0.137011;
+    K_Gain_Matrix(0, 6) = -0.558427;
+    K_Gain_Matrix(0, 7) = -0.000000;
     K_Gain_Matrix(0, 8) = -0.000000;
-    K_Gain_Matrix(0, 9) = -0.083105;
-    K_Gain_Matrix(0, 10) = 0.000000;
+    K_Gain_Matrix(0, 9) = -0.119099;
+    K_Gain_Matrix(0, 10) = -0.000000;
     K_Gain_Matrix(0, 11) = -0.000000;
-    K_Gain_Matrix(1, 0) = -0.070537;
+    K_Gain_Matrix(1, 0) = -0.024983;
     K_Gain_Matrix(1, 1) = -0.000000;
     K_Gain_Matrix(1, 2) = -0.000000;
-    K_Gain_Matrix(1, 3) = -0.241676;
+    K_Gain_Matrix(1, 3) = -0.090671;
     K_Gain_Matrix(1, 4) = -0.000000;
     K_Gain_Matrix(1, 5) = -0.000000;
     K_Gain_Matrix(1, 6) = -0.000000;
-    K_Gain_Matrix(1, 7) = 0.601616;
-    K_Gain_Matrix(1, 8) = 0.070884;
-    K_Gain_Matrix(1, 9) = 0.000000;
-    K_Gain_Matrix(1, 10) = 0.075309;
-    K_Gain_Matrix(1, 11) = 0.072159;
+    K_Gain_Matrix(1, 7) = 0.388680;
+    K_Gain_Matrix(1, 8) = 0.079111;
+    K_Gain_Matrix(1, 9) = -0.000000;
+    K_Gain_Matrix(1, 10) = 0.081516;
+    K_Gain_Matrix(1, 11) = 0.080367;
     K_Gain_Matrix(2, 0) = -0.000000;
-    K_Gain_Matrix(2, 1) = 0.070711;
-    K_Gain_Matrix(2, 2) = -0.070711;
+    K_Gain_Matrix(2, 1) = 0.035355;
+    K_Gain_Matrix(2, 2) = -0.035355;
     K_Gain_Matrix(2, 3) = -0.000000;
-    K_Gain_Matrix(2, 4) = 0.243125;
-    K_Gain_Matrix(2, 5) = -0.250088;
-    K_Gain_Matrix(2, 6) = 0.631922;
-    K_Gain_Matrix(2, 7) = -0.000000;
+    K_Gain_Matrix(2, 4) = 0.128550;
+    K_Gain_Matrix(2, 5) = -0.137011;
+    K_Gain_Matrix(2, 6) = 0.558427;
+    K_Gain_Matrix(2, 7) = 0.000000;
     K_Gain_Matrix(2, 8) = 0.000000;
-    K_Gain_Matrix(2, 9) = 0.083105;
-    K_Gain_Matrix(2, 10) = -0.000000;
-    K_Gain_Matrix(2, 11) = 0.000000;
-    K_Gain_Matrix(3, 0) = -0.070884;
-    K_Gain_Matrix(3, 1) = -0.000000;
+    K_Gain_Matrix(2, 9) = 0.119099;
+    K_Gain_Matrix(2, 10) = 0.000000;
+    K_Gain_Matrix(2, 11) = -0.000000;
+    K_Gain_Matrix(3, 0) = -0.025017;
+    K_Gain_Matrix(3, 1) = 0.000000;
     K_Gain_Matrix(3, 2) = -0.000000;
-    K_Gain_Matrix(3, 3) = -0.242772;
+    K_Gain_Matrix(3, 3) = -0.090778;
     K_Gain_Matrix(3, 4) = 0.000000;
     K_Gain_Matrix(3, 5) = -0.000000;
     K_Gain_Matrix(3, 6) = 0.000000;
-    K_Gain_Matrix(3, 7) = 0.601617;
-    K_Gain_Matrix(3, 8) = -0.070537;
+    K_Gain_Matrix(3, 7) = 0.388638;
+    K_Gain_Matrix(3, 8) = -0.079003;
     K_Gain_Matrix(3, 9) = 0.000000;
-    K_Gain_Matrix(3, 10) = 0.075312;
-    K_Gain_Matrix(3, 11) = -0.071715;
+    K_Gain_Matrix(3, 10) = 0.081516;
+    K_Gain_Matrix(3, 11) = -0.080202;
 
     Offset_Forcing_Matrix(1,7) = 0.00002952;
     Offset_Forcing_Matrix(3,7) = 0.00000754;
@@ -123,14 +128,22 @@ forcing
 
 void ModeBaba::update()
 {
-    AP::ahrs().get_velocity_NED(velVec);
-    AP::ahrs().get_relative_position_NED_origin(relPosVec);
-//    state(0, 0)  = relPosVec.x;
-//    state(1, 0)  = relPosVec.y;
-//    state(2, 0)  = relPosVec.z;
-//    state(3, 0)  = velVec.x;
-//    state(4, 0)  = velVec.y;
-//    state(5, 0)  = velVec.z;
+    AP::ahrs().get_velocity_NED(velNED);
+    AP::ahrs().get_relative_position_NED_origin(relPosNED);
+    //copying over for readability
+    velBody = AP::ahrs().earth_to_body(velNED);
+    relPosBody = AP::ahrs().earth_to_body(relPosNED);
+
+
+    Vector3f desPos(0., 0., -1.);
+    desPos = AP::ahrs().earth_to_body(desPos);
+
+    state(0, 0)  = relPosBody.x;
+    state(1, 0)  = relPosBody.y;
+    state(2, 0)  = relPosBody.z;
+    state(3, 0)  = velBody.x;
+    state(4, 0)  = velBody.y;
+    state(5, 0)  = velBody.z;
     state(6, 0)  = AP::ahrs().get_roll();
     state(7, 0)  = AP::ahrs().get_pitch();
     state(8, 0)  = AP::ahrs().get_yaw();
@@ -139,13 +152,17 @@ void ModeBaba::update()
     state(11, 0) = AP::ahrs().get_gyro().z;
     //Convert Current and Desired States into Body Frame (COME BACK TO THIS)
     //Matrix Math
+    desired_state(0, 0) = desPos.x;
+    desired_state(1, 0) = desPos.y;
+    desired_state(2, 0) = desPos.z;
     desired_state(6, 0) = plopter.channel_roll->norm_input() * PI / 18.;
-    desired_state(7, 0) = plopter.channel_pitch->norm_input()  * PI / 18.;
+    desired_state(7, 0) = -plopter.channel_pitch->norm_input()  * PI / 18.;
     desired_state(8, 0) += (.01 * plopter.channel_rudder->norm_input());
     state_offset = desired_state - state;
 //
 //    std::cout << "\n\n\n\n\n";
-//    desired_state.print();
+//    state_offset.print();
+//    state.print();
 
     uD = Offset_Forcing_Matrix * desired_state;
     u = (K_Gain_Matrix * state_offset) - uD;
@@ -154,8 +171,8 @@ void ModeBaba::update()
     left_thrust = sqrt(pow(u(2,0) + (mass / 2.),2) + pow(u(3,0),2));
 //    u.print();
     //taking LQR desired force in N, converting from 0 to 100% Throttle. Estimating 100% throttle 1.35 * 9.81 N
-    left_thrust = constrain_float(left_thrust / 1.35, 0, .8);
-    right_thrust = constrain_float(right_thrust / 1.35, 0, .8);
+    left_thrust = constrain_float(left_thrust / .8, 0, .8);
+    right_thrust = constrain_float(right_thrust / .8, 0, .8);
 
 //    std::cout << "\n\n\n\n\n";
 //    state.print();
@@ -181,6 +198,8 @@ void ModeBaba::update()
                                         ((left_thrust + 100.) * ((plopter.channel_throttle->norm_input() + 1) / 2)) - 100.);
         SRV_Channels::set_output_scaled(SRV_Channel::k_motor1,
                                         ((right_thrust + 100.) * ((plopter.channel_throttle->norm_input() + 1) / 2)) - 100.);
+//        SRV_Channels::set_output_scaled(SRV_Channel::k_motor2, plopter.channel_throttle->norm_input() * 100.);
+//        SRV_Channels::set_output_scaled(SRV_Channel::k_motor1, plopter.channel_throttle->norm_input() * 100.);
     } else {
             SRV_Channels::set_output_scaled(SRV_Channel::k_motor2, -100.);
             SRV_Channels::set_output_scaled(SRV_Channel::k_motor1, -100.);
@@ -209,6 +228,10 @@ void ModeBaba::navigate()
 
 bool ModeBaba::handle_guided_request(Location target_loc)
 {
-
+    Vector3f desPos;
+    target_loc.get_vector_from_origin_NEU(desPos);
+    desired_state(0, 0) = desPos.x;
+    desired_state(1, 0) = desPos.y;
+    desired_state(2, 0) = desPos.z;
     return true;
 }
