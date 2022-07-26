@@ -141,9 +141,9 @@ void ModeBaba::update()
     state(0, 0)  = relPosBody.x;
     state(1, 0)  = relPosBody.y;
     state(2, 0)  = relPosBody.z;
-    state(3, 0)  = velBody.x;
-    state(4, 0)  = velBody.y;
-    state(5, 0)  = velBody.z;
+    state(3, 0)  = velNED.x;
+    state(4, 0)  = velNED.y;
+    state(5, 0)  = velNED.z;
     state(6, 0)  = AP::ahrs().get_roll();
     state(7, 0)  = AP::ahrs().get_pitch();
     state(8, 0)  = AP::ahrs().get_yaw();
@@ -159,10 +159,16 @@ void ModeBaba::update()
     desired_state(7, 0) = -plopter.channel_pitch->norm_input()  * PI / 18.;
     desired_state(8, 0) += (.01 * plopter.channel_rudder->norm_input());
     state_offset = desired_state - state;
+    state_offset(0,0) = constrain_float(state_offset(0,0), -1., 1.);
+    state_offset(1,0) = constrain_float(state_offset(1,0), -1., 1.);
+    state_offset(2,0) = constrain_float(state_offset(2,0), -1., 1.);
+    state_offset(3,0) = constrain_float(state_offset(3,0), -1., 1.);
+    state_offset(4,0) = constrain_float(state_offset(4,0), -1., 1.);
+    state_offset(5,0) = constrain_float(state_offset(5,0), -1., 1.);
 //
-//    std::cout << "\n\n\n\n\n";
+    std::cout << "\n\n\n\n\n";
 //    state_offset.print();
-//    state.print();
+    state.print();
 
     uD = Offset_Forcing_Matrix * desired_state;
     u = (K_Gain_Matrix * state_offset) - uD;
