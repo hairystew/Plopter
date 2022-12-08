@@ -263,6 +263,8 @@ void Plopter::update_logging2(void)
 
     if (should_log(MASK_LOG_IMU))
         AP::ins().Write_Vibration();
+
+
 }
 
 

@@ -434,7 +434,6 @@ namespace sm {
 
         //scalar addition
         void operator+=(const T& rhs) {
-            ASSERT(rhs.n == n || rhs.m == m, "MATRIX SIZE MISMATCH");
             for (unsigned i = 0; i < n; i++) {
                 for (unsigned j = 0; j < m; j++) {
                     this->data[i][j] += rhs;
@@ -466,8 +465,8 @@ namespace sm {
         Matrix<T> operator*(const T& rhs) {
             Matrix<T> res(this->n, this->m, 0);
 
-            for (unsigned i = 0; i < this->m; i++) {
-                for (unsigned j = 0; j < this->n; j++) {
+            for (unsigned i = 0; i < this->n; i++) {
+                for (unsigned j = 0; j < this->m; j++) {
                     res(i, j) += this->data[i][j] * rhs;
                 }
             }

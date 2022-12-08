@@ -2,6 +2,8 @@
 
 #include "qautotune.h"
 
+#include <iostream> //hrs
+
 /*****************************************************************************
 *   The init_ardupilot function processes everything we need for an in - air restart
 *        We will determine later if we are actually on the ground and process a
@@ -138,10 +140,9 @@ void Plopter::init_ardupilot()
 
     // initialise sensor
 #if AP_OPTICALFLOW_ENABLED
-    if (optflow.enabled()) {
-        optflow.init(-1);
-    }
-#endif
+    // initialise optical flow sensor
+    optflow.init(MASK_LOG_OPTFLOW);
+#endif      // AP_OPTICALFLOW_ENABLED
 
 // init cargo gripper
 #if GRIPPER_ENABLED == ENABLED

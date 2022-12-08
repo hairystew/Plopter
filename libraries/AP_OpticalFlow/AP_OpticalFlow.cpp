@@ -1,6 +1,8 @@
 #include <AP_BoardConfig/AP_BoardConfig.h>
 #include "AP_OpticalFlow.h"
 
+#include <iostream>
+
 #if AP_OPTICALFLOW_ENABLED
 
 #include "AP_OpticalFlow_Onboard.h"
@@ -229,6 +231,7 @@ void OpticalFlow::handle_msp(const MSP::msp_opflow_data_message_t &pkt)
 // start calibration
 void OpticalFlow::start_calibration()
 {
+    std::cout << "STARTING CALIBRATION\n";
     if (_calibrator == nullptr) {
         _calibrator = new AP_OpticalFlow_Calibrator();
         if (_calibrator == nullptr) {
@@ -251,6 +254,7 @@ void OpticalFlow::stop_calibration()
 
 void OpticalFlow::update_state(const OpticalFlow_state &state)
 {
+
     _state = state;
     _last_update_ms = AP_HAL::millis();
 

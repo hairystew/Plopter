@@ -648,11 +648,12 @@ void Plopter::rangefinder_height_update(void)
 {
     float distance = rangefinder.distance_orient(ROTATION_PITCH_270);
     
-    if ((rangefinder.status_orient(ROTATION_PITCH_270) == RangeFinder::Status::Good) && ahrs.home_is_set()) {
+    if ((rangefinder.status_orient(ROTATION_PITCH_270) == RangeFinder::Status::Good)) {
         if (!rangefinder_state.have_initial_reading) {
             rangefinder_state.have_initial_reading = true;
             rangefinder_state.initial_range = distance;
         }
+
         // correct the range for attitude (multiply by DCM.c.z, which
         // is cos(roll)*cos(pitch))
         rangefinder_state.height_estimate = distance * ahrs.get_rotation_body_to_ned().c.z;

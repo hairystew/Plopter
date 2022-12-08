@@ -16,16 +16,17 @@ void Plopter::read_rangefinder(void)
         rangefinder.set_estimated_terrain_height(height);
     } else
 #endif
-    {
+    { //HRS
         // use the best available alt estimate via baro above home
-        if (flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND) {
-            // ensure the rangefinder is powered-on when land alt is higher than home altitude.
-            // This is done using the target alt which we know is below us and we are sinking to it
-            height = height_above_target();
-        } else {
-            // otherwise just use the best available baro estimate above home.
-            height = relative_altitude;
-        }
+//        if (flight_stage == AP_Vehicle::FixedWing::FLIGHT_LAND) {
+//            // ensure the rangefinder is powered-on when land alt is higher than home altitude.
+//            // This is done using the target alt which we know is below us and we are sinking to it
+//            height = height_above_target();
+//        } else {
+//            // otherwise just use the best available baro estimate above home.
+//            height = relative_altitude;
+//        }
+        height = height_above_target();
         rangefinder.set_estimated_terrain_height(height);
     }
 

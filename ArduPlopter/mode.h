@@ -756,13 +756,17 @@ public:
 protected:
 
     sm::Matrix<float> K_Gain_Matrix;
+    sm::Matrix<float> K_Integral_Action_Matrix;
     sm::Matrix<float> Offset_Forcing_Matrix;
     sm::Matrix<float> uD;
     sm::Matrix<float> u;
     sm::Matrix<float> state_offset;
+    sm::Matrix<float> integrated_offset;
+    sm::Matrix<float> integrated_force;
     sm::Matrix<float> desired_state;
     sm::Matrix<float> state;
 
+    float height_offset = 0;
     float left_thrust = 0;
     float right_thrust = 0;
     float left_angle = 0;
@@ -770,7 +774,10 @@ protected:
     float mass = 1.36604; //kg just hardcoding this for now
 
     Vector3f velNED;
+    Vector2f velBod;
     Vector3f relPosNED;
+    Vector2f posNE;
+    float posD;
     Vector3f velBody;
     Vector3f relPosBody;
     Quaternion attQuat;
@@ -778,7 +785,13 @@ protected:
     float left_accum = 0.;
     float right_accum = 0.;
 
-
+    float bruhx = 0;
+    float bruhy = 0;
+    float _last_t = 0;
+    float thrust_scalar = 0;
+    float throttle = 0;
 
     bool _enter() override;
+private:
+    LowPassFilterVector2f flow_filter;
 };
